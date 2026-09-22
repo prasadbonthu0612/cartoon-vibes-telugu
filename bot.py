@@ -1268,7 +1268,7 @@ async def split_video(
     progress_reporter=None,
     title="Video",
 ):
-    """Fast keyframe-aware stream-copy splitter targeting ~60-second clips."""
+    """Fast keyframe-aware stream-copy splitter targeting ~120-second clips."""
     os.makedirs(output_directory, exist_ok=True)
 
     # Get keyframe timestamps. No video is decoded/re-encoded.
@@ -1300,17 +1300,17 @@ async def split_video(
     if not keyframes:
         raise RuntimeError("No video keyframes were found.")
 
-    # Pick boundaries between 55 and 65 seconds, preferring 60 seconds.
+    # Pick boundaries between 115 and 125 seconds, preferring 120 seconds.
     boundaries = []
     current = 0.0
-    while duration - current > 60.0:
-        candidates = [k for k in keyframes if current + 55.0 <= k <= current + 65.0]
+    while duration - current > 120.0:
+        candidates = [k for k in keyframes if current + 115.0 <= k <= current + 125.0]
         if not candidates:
             raise RuntimeError(
-                f"No safe keyframe found between {current + 55:.1f}s and {current + 65:.1f}s. "
-                "Cannot create a safe <=65 second stream-copy clip."
+                f"No safe keyframe found between {current + 115:.1f}s and {current + 125:.1f}s. "
+                "Cannot create a safe <=125 second stream-copy clip."
             )
-        boundary = min(candidates, key=lambda k: abs(k - (current + 60.0)))
+        boundary = min(candidates, key=lambda k: abs(k - (current + 120.0)))
         boundaries.append(boundary)
         current = boundary
 
@@ -1628,8 +1628,8 @@ async def find_queue_manifests():
 async def save_queue_manifest(manifest_message, queue):
     manifest_json = json.dumps(
         queue,
-        indent=2,
-        ensure_ascii=False
+        ensure_ascii=False,
+        separators=(",", ":")
     )
 
     manifest_text = (
@@ -2459,17 +2459,17 @@ async def process_original_video(
             duration = await get_video_duration(original_path)
             boundaries = []
             current = 0.0
-            while duration - current > 60.0:
+            while duration - current > 120.0:
                 candidates = [
                     k for k in keyframes
-                    if current + 45.0 <= k <= current + 60.0
+                    if current + 105.0 <= k <= current + 120.0
                 ]
                 if not candidates:
                     raise RuntimeError(
-                        f"No safe keyframe between {current + 45:.1f}s and {current + 60:.1f}s. "
-                        "Cannot create a stream-copy clip that stays within 60 seconds."
+                        f"No safe keyframe between {current + 105:.1f}s and {current + 120:.1f}s. "
+                        "Cannot create a stream-copy clip that stays within 120 seconds."
                     )
-                boundary = min(candidates, key=lambda k: abs(k - (current + 60.0)))
+                boundary = min(candidates, key=lambda k: abs(k - (current + 120.0)))
                 boundaries.append(boundary)
                 current = boundary
 
