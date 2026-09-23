@@ -72,7 +72,7 @@ UPLOAD_REMINDER_INTERVAL_SECONDS = max(
 # https://telegram-cartoon-bot-if57.onrender.com
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-STORAGE_CHANNEL_NAME = "Cartoon Clip Storage"
+STORAGE_CHANNEL_NAME = "Cartoon Vibes Telugu Storage"
 
 # Telegram transfer tuning. Telethon allows up to 512 KB per file chunk.
 # Larger chunks reduce request overhead for large video transfers.
