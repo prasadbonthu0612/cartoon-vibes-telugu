@@ -11,6 +11,7 @@ import time
 import uuid
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -70,6 +71,10 @@ UPLOAD_REMINDER_INTERVAL_SECONDS = 3600
 # https://telegram-cartoon-bot-if57.onrender.com
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
+# Portrait H.264 encoding is the most memory-intensive local operation.
+# Keep it bounded so a long source video cannot consume the whole Render instance.
+PORTRAIT_FFMPEG_THREADS = max(1, int(os.getenv("PORTRAIT_FFMPEG_THREADS", "2")))
+
 STORAGE_CHANNEL_NAME = "Cartoon Vibes Telugu Storage"
 
 # Telegram transfer tuning. Telethon allows up to 512 KB per file chunk.
@@ -96,6 +101,7 @@ UPLOAD_REMINDER_MARKER = "[UPLOAD_REMINDER]"
 
 telethon_client = None
 bot_application = None
+storage_channel_entity = None
 
 admin_chat_id = None
 pending_video_message_id = None
@@ -312,23 +318,21 @@ def start_health_server():
 # ============================================================
 
 async def find_storage_channel():
+    """Return the storage channel entity, caching it after the first lookup."""
+    global storage_channel_entity
+
+    if storage_channel_entity is not None:
+        return storage_channel_entity
 
     dialogs = await telethon_client.get_dialogs(
         limit=None
     )
 
     for dialog in dialogs:
-
         entity = dialog.entity
-
-        title = getattr(
-            entity,
-            "title",
-            None
-        )
-
+        title = getattr(entity, "title", None)
         if title == STORAGE_CHANNEL_NAME:
-
+            storage_channel_entity = entity
             return entity
 
     return None
@@ -1376,6 +1380,7 @@ async def format_clip_for_reels(
         "-c:v", "libx264",
         "-preset", "veryfast",
         "-crf", "23",
+        "-threads", str(PORTRAIT_FFMPEG_THREADS),
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
@@ -1513,6 +1518,76 @@ def format_duration(seconds):
     return f"{minutes}m {seconds:02d}s"
 
 
+def get_runtime_resource_snapshot(temp_directory=None):
+    """Return service-wide memory telemetry, including FFmpeg child processes."""
+    def read_number(path):
+        try:
+            raw = Path(path).read_text(encoding="utf-8").strip()
+            if raw == "max":
+                return None
+            return int(raw)
+        except (OSError, ValueError):
+            return None
+
+    current_bytes = None
+    limit_bytes = None
+    peak_bytes = None
+
+    # Render runs the service inside Linux cgroups. cgroup memory includes
+    # Python plus FFmpeg child processes, which is what the platform limits.
+    cgroup_v2_current = "/sys/fs/cgroup/memory.current"
+    cgroup_v2_limit = "/sys/fs/cgroup/memory.max"
+    cgroup_v2_peak = "/sys/fs/cgroup/memory.peak"
+
+    if os.path.exists(cgroup_v2_current):
+        current_bytes = read_number(cgroup_v2_current)
+        limit_bytes = read_number(cgroup_v2_limit)
+        peak_bytes = read_number(cgroup_v2_peak)
+    else:
+        current_bytes = read_number("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        limit_bytes = read_number("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        peak_bytes = read_number("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
+
+    # Fallback for environments without readable cgroup files.
+    if current_bytes is None:
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as proc_status:
+                for line in proc_status:
+                    if line.startswith("VmRSS:"):
+                        current_bytes = int(line.split()[1]) * 1024
+                    elif line.startswith("VmHWM:") and peak_bytes is None:
+                        peak_bytes = int(line.split()[1]) * 1024
+        except (OSError, ValueError, IndexError):
+            pass
+
+    parts = []
+
+    if current_bytes is not None:
+        current_mb = current_bytes / (1024 ** 2)
+        if limit_bytes and limit_bytes > 0 and limit_bytes < (1 << 60):
+            limit_mb = limit_bytes / (1024 ** 2)
+            percent = (current_bytes / limit_bytes) * 100.0
+            warning = " ⚠️ HIGH" if percent >= 85.0 else ""
+            parts.append(f"RAM: {current_mb:.0f}/{limit_mb:.0f} MB ({percent:.0f}%){warning}")
+        else:
+            parts.append(f"RAM: {current_mb:.0f} MB")
+
+    if peak_bytes is not None:
+        parts.append(f"Peak: {peak_bytes / (1024 ** 2):.0f} MB")
+
+    if temp_directory:
+        try:
+            disk_free_gb = shutil.disk_usage(temp_directory).free / (1024 ** 3)
+            parts.append(f"Disk free: {disk_free_gb:.1f} GB")
+        except OSError:
+            pass
+
+    return " | ".join(parts) if parts else "Runtime telemetry unavailable"
+
+def print_runtime_resources(label, temp_directory=None):
+    print(f"🧠 {label}: {get_runtime_resource_snapshot(temp_directory)}")
+
+
 def progress_bar(percent, width=20):
     percent = max(0.0, min(100.0, float(percent)))
     filled = int(round(width * percent / 100))
@@ -1564,6 +1639,12 @@ def build_live_processing_report(
 
     if details:
         lines.extend(["", "📡 Live details:", details])
+
+    lines.extend([
+        "",
+        "🧠 Runtime:",
+        get_runtime_resource_snapshot(),
+    ])
 
     return "\n".join(lines)
 
@@ -2889,6 +2970,7 @@ async def process_original_video(
         )
 
         print("Downloading original...")
+        print_runtime_resources("Before source download", temp_directory)
 
         workflow_started = time.monotonic()
         download_started = workflow_started
@@ -2928,6 +3010,8 @@ async def process_original_video(
             raise RuntimeError(
                 "Failed to download original video."
             )
+
+        print_runtime_resources("After source download", temp_directory)
 
         # ----------------------------------------------------
         # FAST STREAM-COPY SPLIT + IMMEDIATE TELEGRAM UPLOAD
@@ -3085,7 +3169,19 @@ async def process_original_video(
             await append_clip_to_queue(
                 manifest_message, queue, uploaded_message, title, index
             )
+
+            # The clip is now safely stored in Telegram and persisted in the queue.
+            # Do not keep every finished portrait clip on the Render filesystem.
+            try:
+                os.remove(final_path)
+            except FileNotFoundError:
+                pass
+
             print(f"Uploaded Part {index}: Telegram message ID {uploaded_message.id}; added to live queue.")
+            print_runtime_resources(
+                f"After Part {index} local cleanup",
+                temp_directory,
+            )
 
         # Run FFmpeg segmentation once. While it runs, watch for finalized
         # segment files and upload them immediately.
@@ -3192,7 +3288,9 @@ async def process_original_video(
             stderr_task = asyncio.create_task(proc.stderr.read())
             return proc, stderr_task, split_progress_task, duration, boundaries
 
+        print_runtime_resources("Before stream-copy splitter", temp_directory)
         process, stderr_task, split_progress_task, source_duration, boundaries = await run_stream_splitter()
+        print_runtime_resources("Stream-copy splitter started", temp_directory)
         wait_task = asyncio.create_task(process.wait())
         while not wait_task.done():
             current_files = sorted(
@@ -3221,6 +3319,7 @@ async def process_original_video(
         stderr = await stderr_task
         await split_progress_task
         splitter_done = True
+        print_runtime_resources("Stream-copy splitter finished", temp_directory)
         if return_code != 0:
             raise RuntimeError(
                 "FFmpeg failed to split the video.\n"
@@ -3272,6 +3371,7 @@ async def process_original_video(
         )
 
         print(f"FAST split/upload complete: {len(uploaded_messages)} clips.")
+        print_runtime_resources("All split clips uploaded and local files cleaned", temp_directory)
 
         # ----------------------------------------------------
         # SAFETY CHECK
@@ -4784,6 +4884,117 @@ async def handle_video(
 # MAIN
 # ============================================================
 
+async def recover_interrupted_processing(application):
+    """Recover a processing job that was interrupted by a Render restart."""
+    global current_processing_task
+
+    try:
+        state = await load_processing_state()
+        if not state:
+            return
+
+        video_message_id = state.get("video_message_id")
+        title = state.get("title", "Recovered video")
+        if not video_message_id:
+            print("⚠️ Stale processing state has no video ID; leaving it untouched.")
+            return
+
+        manifests = await find_queue_manifests()
+        matching = None
+        for item in manifests:
+            queue = item.get("queue", {})
+            if queue.get("original_telegram_message_id") == video_message_id:
+                matching = item
+                break
+
+        storage_channel = await find_storage_channel()
+        if storage_channel is None:
+            print("⚠️ Cannot recover interrupted processing: storage channel unavailable.")
+            return
+
+        if matching and matching["queue"].get("processing_complete"):
+            # The durable queue is complete. The process probably died during
+            # finalization, so finish the safe cleanup rather than duplicating clips.
+            try:
+                await telethon_client.delete_messages(storage_channel, video_message_id)
+            except Exception as cleanup_error:
+                print(
+                    "⚠️ Recovery could not delete the original after a completed queue: "
+                    f"{type(cleanup_error).__name__}: {str(cleanup_error)}"
+                )
+
+            await delete_title_request()
+            await delete_processing_state()
+            await application.bot.send_message(
+                chat_id=admin_chat_id,
+                text=(
+                    "♻️ PROCESSING RECOVERY COMPLETE\n\n"
+                    f"🎬 {title}\n"
+                    "📋 The Telegram queue was already complete when Render restarted.\n"
+                    "✅ No duplicate clips were generated."
+                ),
+            )
+            print(f"♻️ Recovered completed processing state for {video_message_id}.")
+            return
+
+        # The queue was incomplete (or had not been created yet). Delete only
+        # the durable partial clips recorded in that queue, then safely restart
+        # from the original Telegram message. The original is never deleted by
+        # this recovery path before processing completes.
+        if matching:
+            queue = matching["queue"]
+            for clip_id in queue.get("clip_message_ids", []):
+                try:
+                    await telethon_client.delete_messages(storage_channel, int(clip_id))
+                except Exception as cleanup_error:
+                    print(
+                        f"⚠️ Recovery could not delete partial clip {clip_id}: "
+                        f"{type(cleanup_error).__name__}: {str(cleanup_error)}"
+                    )
+            try:
+                await telethon_client.delete_messages(
+                    storage_channel,
+                    matching["message"].id,
+                )
+            except Exception as cleanup_error:
+                print(
+                    "⚠️ Recovery could not delete the interrupted queue manifest: "
+                    f"{type(cleanup_error).__name__}: {str(cleanup_error)}"
+                )
+
+        print(
+            f"♻️ Render restart detected an interrupted job: {title} "
+            f"(video {video_message_id}). Restarting safely from the original video."
+        )
+        await application.bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                "♻️ PROCESSING RECOVERY\n\n"
+                f"🎬 {title}\n"
+                "⚠️ The previous Render process was interrupted.\n"
+                "🧹 Partial generated clips were cleaned up.\n"
+                "🔄 Restarting safely from the original video..."
+            ),
+        )
+
+        async def resume_job():
+            global current_processing_task
+            current_processing_task = asyncio.current_task()
+            try:
+                await process_original_video(video_message_id, title, admin_chat_id)
+            finally:
+                if current_processing_task is asyncio.current_task():
+                    current_processing_task = None
+
+        application.create_task(resume_job(), update=None)
+
+    except Exception as e:
+        print(
+            "❌ Interrupted-processing recovery failed: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+
 async def application_post_init(application):
     """
     Load persistent settings, register the Telegram command menu,
@@ -4830,6 +5041,8 @@ async def application_post_init(application):
             "⚠️ Could not register Telegram command menu: "
             f"{type(e).__name__}: {str(e)}"
         )
+
+    await recover_interrupted_processing(application)
 
     application.create_task(
         instagram_queue_loop(),
