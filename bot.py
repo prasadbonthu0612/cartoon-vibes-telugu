@@ -12,7 +12,7 @@ import uuid
 import urllib.parse
 import urllib.request
 
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -106,6 +106,10 @@ pending_video_message_id = None
 # token -> {"path": local_file_path, "content_type": "video/mp4"}
 public_media_files = {}
 public_media_lock = threading.Lock()
+
+# Prevent the background worker and manual /publish_queue command from
+# publishing the same clip concurrently.
+queue_publish_lock = asyncio.Lock()
 
 
 # ============================================================
@@ -793,7 +797,7 @@ async def start(
             "👋 Hello!\n\n"
             "✅ Your Telegram account is connected.\n\n"
             "🎬 Upload the ORIGINAL video "
-            "directly to Cartoon Clip Storage.\n\n"
+            f"directly to {STORAGE_CHANNEL_NAME}.\n\n"
             "I'll detect it automatically and "
             "ask for the title."
         )
@@ -1015,6 +1019,30 @@ async def save_processing_state(
         storage_channel,
         text
     )
+
+
+async def load_processing_state():
+    """Return the active persistent processing record, if one exists."""
+
+    storage_channel = await find_storage_channel()
+    if storage_channel is None:
+        return None
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=100
+    )
+
+    for message in messages:
+        text = message.message or ""
+        if not text.startswith(PROCESSING_MARKER):
+            continue
+        try:
+            return json.loads(text.split("\n", 1)[1])
+        except Exception:
+            continue
+
+    return None
 
 
 async def delete_processing_state():
@@ -1490,62 +1518,31 @@ async def create_automatic_queue(
     original_message_id,
     uploaded_clips
 ):
+    """
+    Create a compact persistent queue.
 
-    now = datetime.now(
-        timezone.utc
-    ).isoformat()
+    IMPORTANT: Telegram messages have a hard text-length limit. The previous
+    queue stored a large object for every clip and eventually exceeded that
+    limit. Queue V2 stores only Telegram message IDs plus aggregate state.
+    """
 
-    queue_id = (
-        f"queue_{now}"
-    )
+    now = datetime.now(timezone.utc).isoformat()
+    queue_id = f"queue_{now}"
 
     queue = {
+        "queue_version": 2,
         "queue_id": queue_id,
         "title": title,
         "created_at": now,
         "status": "PENDING",
         "processing_complete": False,
-        "original_telegram_message_id":
-            original_message_id,
-        "total_clips":
-            len(uploaded_clips),
+        "original_telegram_message_id": original_message_id,
+        "total_clips": len(uploaded_clips),
         "next_clip_index": 1,
-        "clips": []
+        "clip_message_ids": [message.id for message in uploaded_clips],
+        "last_published_at": None,
+        "retry_after": None,
     }
-
-    for index, message in enumerate(
-        uploaded_clips,
-        start=1
-    ):
-
-        queue["clips"].append({
-
-            "index": index,
-
-            "telegram_message_id":
-                message.id,
-
-            # FIX:
-            # Generate the filename ourselves instead
-            # of relying on Telegram's reported filename.
-            "filename":
-                f"{safe_filename(title)} Part {index}.mp4",
-
-            "status":
-                "PENDING",
-
-            "instagram_status":
-                "NOT_POSTED",
-
-            "instagram_media_id":
-                None,
-
-            "posted_at":
-                None,
-
-            "deleted_from_telegram":
-                False
-        })
 
     manifest_json = json.dumps(
         queue,
@@ -1559,29 +1556,117 @@ async def create_automatic_queue(
         f"{manifest_json}"
     )
 
-    manifest_message = (
-        await telethon_client.send_message(
-            storage_channel,
-            manifest_text
-        )
+    manifest_message = await telethon_client.send_message(
+        storage_channel,
+        manifest_text
     )
 
     return queue, manifest_message
 
-async def append_clip_to_queue(manifest_message, queue, message, title, index):
-    """Append one newly uploaded clip to a live persistent queue."""
-    queue["clips"].append({
-        "index": index,
-        "telegram_message_id": message.id,
-        "filename": f"{safe_filename(title)} Part {index}.mp4",
-        "status": "PENDING",
-        "instagram_status": "NOT_POSTED",
-        "instagram_media_id": None,
-        "posted_at": None,
-        "deleted_from_telegram": False,
-    })
-    queue["total_clips"] = len(queue["clips"])
-    await save_queue_manifest(manifest_message, queue)
+
+async def append_clip_to_queue(
+    manifest_message,
+    queue,
+    message,
+    title,
+    index
+):
+    """Persist one clip using only its Telegram message ID."""
+
+    clip_message_ids = queue.setdefault(
+        "clip_message_ids",
+        []
+    )
+
+    if message.id not in clip_message_ids:
+        clip_message_ids.append(message.id)
+
+    queue["total_clips"] = len(clip_message_ids)
+
+    await save_queue_manifest(
+        manifest_message,
+        queue
+    )
+
+
+# ============================================================
+# INSTAGRAM QUEUE PUBLISHER
+# ============================================================
+
+async def find_queue_manifests():
+    storage_channel = await find_storage_channel()
+
+    if storage_channel is None:
+        return []
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=200
+    )
+
+    manifests = []
+
+    for message in messages:
+        text = message.message or ""
+
+        if not text.startswith(QUEUE_MARKER):
+            continue
+
+        try:
+            json_text = text.split("\n\n", 2)[-1]
+            queue = json.loads(json_text)
+
+            manifests.append({
+                "message": message,
+                "queue": queue,
+            })
+
+        except Exception as e:
+            print(
+                f"⚠️ Could not parse queue manifest "
+                f"{message.id}: {type(e).__name__}: {str(e)}"
+            )
+
+    # Oldest queue first. A newer upload must not jump ahead of an older one.
+    manifests.sort(
+        key=lambda item: item["queue"].get("created_at", "")
+    )
+
+    return manifests
+
+
+async def save_queue_manifest(manifest_message, queue):
+    manifest_json = json.dumps(
+        queue,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+    manifest_text = (
+        f"{QUEUE_MARKER}\n\n"
+        f"Cartoon Instagram Bot Queue\n\n"
+        f"{manifest_json}"
+    )
+
+    # Leave safety margin below Telegram's 4096-character text limit.
+    if len(manifest_text) > 3500:
+        raise RuntimeError(
+            "Queue manifest is unexpectedly large. "
+            "The compact queue format was not preserved."
+        )
+
+    storage_channel = await find_storage_channel()
+
+    if storage_channel is None:
+        raise RuntimeError(
+            f'Could not find "{STORAGE_CHANNEL_NAME}".'
+        )
+
+    await safe_telethon_edit_message(
+        storage_channel,
+        manifest_message.id,
+        manifest_text
+    )
 
 
 # ============================================================
@@ -1836,228 +1921,213 @@ async def publish_one_queue_clip(
 
 
 async def get_last_successful_instagram_publish_time(manifests):
-    """
-    Find the most recent successful Instagram publication time across
-    all Telegram queue manifests. The timestamp is stored in the queue
-    manifest, so the one-hour cooldown survives Render restarts.
-    """
+    """Return the latest successful Instagram publication timestamp."""
+
     latest = None
 
     for item in manifests:
         queue = item.get("queue", {})
 
+        value = queue.get("last_published_at")
+        if value:
+            try:
+                timestamp = datetime.fromisoformat(
+                    value.replace("Z", "+00:00")
+                )
+                if timestamp.tzinfo is None:
+                    timestamp = timestamp.replace(tzinfo=timezone.utc)
+                if latest is None or timestamp > latest:
+                    latest = timestamp
+            except Exception:
+                pass
+
+        # Backward compatibility with old queue manifests.
         for clip in queue.get("clips", []):
             if clip.get("instagram_status") != "PUBLISHED":
                 continue
-
             posted_at = clip.get("posted_at")
             if not posted_at:
                 continue
-
             try:
                 timestamp = datetime.fromisoformat(
                     posted_at.replace("Z", "+00:00")
                 )
-
                 if timestamp.tzinfo is None:
                     timestamp = timestamp.replace(tzinfo=timezone.utc)
-
                 if latest is None or timestamp > latest:
                     latest = timestamp
             except Exception:
-                continue
+                pass
 
     return latest
 
 
-async def process_pending_queues():
-    """
-    Scan Telegram queue manifests and publish at most ONE clip per
-    configured interval.
+async def _process_pending_queues():
+    """Publish at most one Reel when a queue is ready and its cooldown allows it."""
 
-    The daily 06:00-21:00 IST publishing window is temporarily disabled
-    for testing. A failed clip remains in Telegram and can be retried on
-    a later scan, subject to the configured publishing interval.
-    """
     if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_USER_ID:
-        print(
-            "⚠️ Instagram credentials are missing. "
-            "Queue publisher is disabled."
-        )
+        print("⚠️ Instagram credentials are missing. Queue publisher is disabled.")
         return
 
     if not PUBLIC_BASE_URL:
-        print(
-            "⚠️ PUBLIC_BASE_URL is missing. "
-            "Queue publisher is disabled."
-        )
+        print("⚠️ PUBLIC_BASE_URL is missing. Queue publisher is disabled.")
         return
 
-    try:
-        # TEMPORARILY DISABLED FOR TESTING:
-        # The 06:00-21:00 IST publishing window is intentionally bypassed.
-        # The 30-minute interval remains active.
-        manifests = await find_queue_manifests()
+    manifests = await find_queue_manifests()
 
-        # Enforce the posting interval using timestamps persisted in the
-        # Telegram queue manifests. This prevents a Render restart or a
-        # manual /publish_queue command from bypassing the 30-minute limit.
-        last_publish = await get_last_successful_instagram_publish_time(
-            manifests
-        )
+    last_publish = await get_last_successful_instagram_publish_time(manifests)
+    if last_publish is not None:
+        elapsed = (
+            datetime.now(timezone.utc) - last_publish
+        ).total_seconds()
+        if elapsed < INSTAGRAM_POST_INTERVAL_SECONDS:
+            remaining = int(INSTAGRAM_POST_INTERVAL_SECONDS - elapsed)
+            print(
+                "⏳ Instagram posting cooldown active. "
+                f"Next Reel allowed in {remaining // 60}m {remaining % 60}s."
+            )
+            return
 
-        if last_publish is not None:
-            now = datetime.now(timezone.utc)
-            elapsed = (now - last_publish).total_seconds()
+    for item in manifests:
+        manifest_message = item["message"]
+        queue = item["queue"]
 
-            if elapsed < INSTAGRAM_POST_INTERVAL_SECONDS:
-                remaining = int(
-                    INSTAGRAM_POST_INTERVAL_SECONDS - elapsed
-                )
-                minutes = remaining // 60
-                seconds = remaining % 60
+        if queue.get("status") == "COMPLETED":
+            continue
 
-                print(
-                    "⏳ Instagram posting cooldown active. "
-                    f"Next Reel allowed in {minutes}m {seconds}s."
-                )
-                return
+        # HARD BARRIER: Instagram can never publish until the splitter and
+        # every Telegram clip upload have completed.
+        if not queue.get("processing_complete", False):
+            print(
+                f"⏳ Queue {queue.get('queue_id')} is not complete yet. "
+                "Instagram publishing is blocked."
+            )
+            continue
 
-        for item in manifests:
-            manifest_message = item["message"]
-            queue = item["queue"]
+        # V2 compact queue.
+        if queue.get("queue_version") == 2 and "clip_message_ids" in queue:
+            total = int(queue.get("total_clips", 0))
+            next_index = int(queue.get("next_clip_index", 1))
 
-            queue_status = queue.get("status", "PENDING")
+            retry_after = queue.get("retry_after")
+            if retry_after:
+                try:
+                    retry_time = datetime.fromisoformat(
+                        retry_after.replace("Z", "+00:00")
+                    )
+                    if retry_time.tzinfo is None:
+                        retry_time = retry_time.replace(tzinfo=timezone.utc)
+                    if datetime.now(timezone.utc) < retry_time:
+                        print(
+                            f"⏳ Queue {queue.get('queue_id')} is waiting "
+                            f"until {retry_time.isoformat()} after a previous failure."
+                        )
+                        continue
+                    queue["retry_after"] = None
+                    await save_queue_manifest(manifest_message, queue)
+                except Exception:
+                    queue["retry_after"] = None
 
-            if queue_status == "COMPLETED":
-                continue
-
-            clips = queue.get("clips", [])
-
-            # IMPORTANT:
-            # Wait until the entire video has been split and every generated
-            # clip has been uploaded to Telegram before publishing anything
-            # to Instagram. This prevents the Instagram publisher from
-            # running concurrently with the splitter/upload pipeline.
-            if not queue.get("processing_complete", False):
-                print(
-                    f"⏳ Queue {queue.get('queue_id')} is still being "
-                    "split/uploaded. Instagram publishing will start "
-                    "only after processing is complete."
-                )
-                continue
-
-            # Find the first clip that has not been successfully
-            # published yet.
-            target_clip = None
-
-            for clip in clips:
-                if clip.get("instagram_status") == "PUBLISHED":
-                    continue
-
-                target_clip = clip
-                break
-
-            if target_clip is None:
-                if not queue.get("processing_complete", False):
-                    return
+            if next_index > total:
                 queue["status"] = "COMPLETED"
-                queue["next_clip_index"] = (
-                    queue.get("total_clips", len(clips)) + 1
-                )
-
-                await save_queue_manifest(
-                    manifest_message,
-                    queue
-                )
-
+                await save_queue_manifest(manifest_message, queue)
                 if admin_chat_id:
                     await bot_application.bot.send_message(
                         chat_id=admin_chat_id,
                         text=(
                             "🎉 INSTAGRAM QUEUE COMPLETE!\n\n"
                             f"🎬 {queue.get('title', 'Cartoon')}\n"
-                            f"📤 Published: {queue.get('total_clips', len(clips))}\n"
-                            "🗑️ Successfully published clips "
-                            "were removed from Telegram."
+                            f"📤 Published: {total}\n"
+                            "🗑️ Successfully published clips were removed from Telegram."
                         )
                     )
-
                 continue
 
-            clip_index = target_clip.get("index")
+            clip_message_ids = queue.get("clip_message_ids", [])
+            if next_index > len(clip_message_ids):
+                raise RuntimeError(
+                    f"Queue {queue.get('queue_id')} is missing the Telegram "
+                    f"message ID for Part {next_index}."
+                )
 
-            print(
-                f"🚀 Starting Instagram queue item "
-                f"{queue.get('queue_id')} "
-                f"Part {clip_index}."
-            )
+            title = queue.get("title", "Cartoon")
+            telegram_message_id = clip_message_ids[next_index - 1]
 
-            target_clip["status"] = "PUBLISHING"
-            target_clip["instagram_status"] = "PUBLISHING"
-
-            await save_queue_manifest(
-                manifest_message,
-                queue
-            )
+            clip = {
+                "index": next_index,
+                "telegram_message_id": telegram_message_id,
+                "filename": f"{safe_filename(title)} Part {next_index}.mp4",
+                "status": "PUBLISHING",
+                "instagram_status": "PUBLISHING",
+                "instagram_media_id": None,
+                "posted_at": None,
+                "deleted_from_telegram": False,
+            }
 
             try:
                 media_id = await publish_one_queue_clip(
                     manifest_message,
                     queue,
-                    target_clip
+                    clip
                 )
 
-                queue["next_clip_index"] = (
-                    int(clip_index) + 1
-                )
+                # Advance only after Instagram has confirmed publication.
+                queue["next_clip_index"] = next_index + 1
+                queue["last_published_at"] = datetime.now(timezone.utc).isoformat()
+                queue["retry_after"] = None
 
-                # Check whether all clips are now published.
-                all_published = all(
-                    clip.get("instagram_status") == "PUBLISHED"
-                    for clip in clips
-                )
-
-                if all_published and queue.get("processing_complete", False):
+                if queue["next_clip_index"] > total:
                     queue["status"] = "COMPLETED"
 
-                await save_queue_manifest(
-                    manifest_message,
-                    queue
-                )
+                await save_queue_manifest(manifest_message, queue)
 
                 if admin_chat_id:
                     await bot_application.bot.send_message(
                         chat_id=admin_chat_id,
                         text=(
                             "✅ INSTAGRAM REEL PUBLISHED!\n\n"
-                            f"🎬 {queue.get('title', 'Cartoon')}\n"
-                            f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n"
+                            f"🎬 {title}\n"
+                            f"📌 Part: {next_index}/{total}\n"
                             f"🆔 Instagram Media ID: {media_id}\n\n"
                             + (
                                 "🗑️ Telegram clip deleted after successful publishing."
-                                if target_clip.get("deleted_from_telegram")
+                                if clip.get("deleted_from_telegram")
                                 else "⚠️ Instagram published successfully, but Telegram cleanup failed."
                             )
                         )
                     )
-
-                # Publish only one clip per scan. This avoids
-                # hammering the API and makes failures isolated.
                 return
 
             except Exception as e:
-                target_clip["status"] = "FAILED"
-                target_clip["instagram_status"] = "FAILED"
+                error_text = str(e)
 
-                await save_queue_manifest(
-                    manifest_message,
-                    queue
-                )
+                # Meta's Media Publish Limit Exceeded should not be hammered
+                # every minute. It is a rolling publishing-quota condition.
+                if (
+                    "2207042" in error_text
+                    or "Media Publish Limit Exceeded" in error_text
+                ):
+                    retry_seconds = 24 * 60 * 60
+                else:
+                    retry_seconds = 10 * 60
+
+                queue["retry_after"] = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=retry_seconds)
+                ).isoformat()
+
+                try:
+                    await save_queue_manifest(manifest_message, queue)
+                except Exception as manifest_error:
+                    print(
+                        "⚠️ Could not save Instagram retry state: "
+                        f"{type(manifest_error).__name__}: {str(manifest_error)}"
+                    )
 
                 print(
-                    "❌ Instagram publishing failed.\n"
-                    f"{type(e).__name__}: {str(e)}"
+                    "❌ Instagram publishing failed. "
+                    f"{type(e).__name__}: {error_text}. "
+                    f"Retry backoff: {retry_seconds}s."
                 )
 
                 if admin_chat_id:
@@ -2065,22 +2135,79 @@ async def process_pending_queues():
                         chat_id=admin_chat_id,
                         text=(
                             "❌ INSTAGRAM REEL PUBLISH FAILED\n\n"
-                            f"🎬 {queue.get('title', 'Cartoon')}\n"
-                            f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n"
+                            f"🎬 {title}\n"
+                            f"📌 Part: {next_index}/{total}\n"
                             f"Error: {type(e).__name__}\n"
-                            f"{str(e)}\n\n"
+                            f"{error_text}\n\n"
                             "⚠️ The Telegram clip was NOT deleted.\n"
-                            "It will remain available for retry."
+                            f"⏳ Automatic retry is delayed for "
+                            f"{retry_seconds // 3600 if retry_seconds >= 3600 else retry_seconds // 60}"
+                            f"{' hours' if retry_seconds >= 3600 else ' minutes'}."
                         )
                     )
-
                 return
 
-    except Exception as e:
-        print(
-            "❌ Queue publisher scan failed:\n"
-            f"{type(e).__name__}: {str(e)}"
+        # Legacy queue compatibility.
+        clips = queue.get("clips", [])
+        target_clip = next(
+            (
+                clip for clip in clips
+                if clip.get("instagram_status") != "PUBLISHED"
+            ),
+            None
         )
+
+        if target_clip is None:
+            queue["status"] = "COMPLETED"
+            queue["next_clip_index"] = queue.get("total_clips", len(clips)) + 1
+            await save_queue_manifest(manifest_message, queue)
+            continue
+
+        clip_index = target_clip.get("index")
+        try:
+            media_id = await publish_one_queue_clip(
+                manifest_message,
+                queue,
+                target_clip
+            )
+            queue["next_clip_index"] = int(clip_index) + 1
+            if queue["next_clip_index"] > queue.get("total_clips", len(clips)):
+                queue["status"] = "COMPLETED"
+            await save_queue_manifest(manifest_message, queue)
+            if admin_chat_id:
+                await bot_application.bot.send_message(
+                    chat_id=admin_chat_id,
+                    text=(
+                        "✅ INSTAGRAM REEL PUBLISHED!\n\n"
+                        f"🎬 {queue.get('title', 'Cartoon')}\n"
+                        f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n"
+                        f"🆔 Instagram Media ID: {media_id}\n\n"
+                        + (
+                            "🗑️ Telegram clip deleted after successful publishing."
+                            if target_clip.get("deleted_from_telegram")
+                            else "⚠️ Instagram published successfully, but Telegram cleanup failed."
+                        )
+                    )
+                )
+            return
+        except Exception as e:
+            target_clip["status"] = "FAILED"
+            target_clip["instagram_status"] = "FAILED"
+            try:
+                await save_queue_manifest(manifest_message, queue)
+            except Exception:
+                pass
+            print(
+                "❌ Legacy Instagram publishing failed: "
+                f"{type(e).__name__}: {str(e)}"
+            )
+            return
+
+
+async def process_pending_queues():
+    """Serialize background and manual Instagram queue publishing."""
+    async with queue_publish_lock:
+        return await _process_pending_queues()
 
 
 async def get_last_upload_reminder_time():
@@ -2118,11 +2245,11 @@ async def get_last_upload_reminder_time():
 
 
 async def storage_channel_is_idle(manifests):
-    """True when there is no video waiting for a title/processing or Instagram publishing."""
+    """Return True when no title/processing/publishing work is pending."""
+
     if await load_title_request():
         return False
 
-    # Check the persistent processing marker.
     storage_channel = await find_storage_channel()
     if storage_channel is None:
         return False
@@ -2142,9 +2269,16 @@ async def storage_channel_is_idle(manifests):
         if queue.get("status") == "COMPLETED":
             continue
 
-        for clip in queue.get("clips", []):
-            if clip.get("instagram_status") != "PUBLISHED":
+        if not queue.get("processing_complete", False):
+            return False
+
+        if queue.get("queue_version") == 2 and "clip_message_ids" in queue:
+            if int(queue.get("next_clip_index", 1)) <= int(queue.get("total_clips", 0)):
                 return False
+        else:
+            for clip in queue.get("clips", []):
+                if clip.get("instagram_status") != "PUBLISHED":
+                    return False
 
     return True
 
@@ -2244,6 +2378,11 @@ async def process_original_video(
     temp_directory = tempfile.mkdtemp(
         prefix="cartoon_bot_"
     )
+
+    queue = None
+    manifest_message = None
+    uploaded_messages = []
+    processing_complete = False
 
     try:
 
@@ -2357,7 +2496,7 @@ async def process_original_video(
         )
         queue["processing_complete"] = False
         queue["total_clips"] = 0
-        queue["clips"] = []
+        queue["clip_message_ids"] = []
         await save_queue_manifest(manifest_message, queue)
 
         uploaded_messages = []
@@ -2554,6 +2693,7 @@ async def process_original_video(
         queue["processing_complete"] = True
         queue["total_clips"] = len(uploaded_messages)
         await save_queue_manifest(manifest_message, queue)
+        processing_complete = True
 
         print(f"FAST split/upload complete: {len(uploaded_messages)} clips.")
 
@@ -2619,22 +2759,68 @@ async def process_original_video(
             f"{type(e).__name__}: {str(e)}"
         )
 
-        # IMPORTANT:
-        # We deliberately DO NOT delete the original.
-        # It remains available for recovery.
+        # Processing failed before the queue became publishable. Remove only
+        # clips generated by this attempt and its queue manifest. The original
+        # video is deliberately kept in Telegram for safety.
+        if not processing_complete:
+            for uploaded_message in uploaded_messages:
+                try:
+                    await telethon_client.delete_messages(
+                        storage_channel,
+                        uploaded_message.id
+                    )
+                except Exception as cleanup_error:
+                    print(
+                        "⚠️ Could not delete partial generated clip "
+                        f"{uploaded_message.id}: "
+                        f"{type(cleanup_error).__name__}: {str(cleanup_error)}"
+                    )
 
-        await bot_application.bot.send_message(
-            chat_id=admin_chat_id,
-            text=(
-                "❌ VIDEO PROCESSING FAILED\n\n"
-                f"🎬 {title}\n\n"
-                f"Error: {type(e).__name__}\n"
-                f"{str(e)}\n\n"
-                "⚠️ The original video was NOT deleted.\n"
-                "Your video is still safe in "
-                "Cartoon Clip Storage."
+            if manifest_message is not None:
+                try:
+                    await telethon_client.delete_messages(
+                        storage_channel,
+                        manifest_message.id
+                    )
+                except Exception as cleanup_error:
+                    print(
+                        "⚠️ Could not delete failed queue manifest: "
+                        f"{type(cleanup_error).__name__}: {str(cleanup_error)}"
+                    )
+
+        try:
+            await delete_title_request()
+        except Exception:
+            pass
+
+        try:
+            await delete_processing_state()
+        except Exception:
+            pass
+
+        try:
+            await bot_application.bot.send_message(
+                chat_id=admin_chat_id,
+                text=(
+                    "❌ VIDEO PROCESSING FAILED\n\n"
+                    f"🎬 {title}\n\n"
+                    f"Error: {type(e).__name__}\n"
+                    f"{str(e)}\n\n"
+                    "⚠️ The original video was NOT deleted.\n"
+                    f"Your video is still safe in {STORAGE_CHANNEL_NAME}.\n\n"
+                    + (
+                        "Generated partial clips from this failed processing "
+                        "attempt were cleaned up."
+                        if not processing_complete
+                        else "The completed Instagram queue was preserved."
+                    )
+                )
             )
-        )
+        except Exception as notify_error:
+            print(
+                "⚠️ Could not send processing failure notification: "
+                f"{type(notify_error).__name__}: {str(notify_error)}"
+            )
 
     finally:
 
@@ -2717,6 +2903,31 @@ async def channel_video_handler(event):
                 "Send /start to the bot first."
             )
 
+            return
+
+        # Never replace an active processing job or pending title request.
+        processing_state = await load_processing_state()
+        if processing_state:
+            await bot_application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⏳ A video is already being processed.\n\n"
+                    f"🎬 {processing_state.get('title', 'Current video')}\n"
+                    "Please wait until it finishes."
+                )
+            )
+            return
+
+        existing_title_request = await load_title_request()
+        if existing_title_request:
+            await bot_application.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    "⏳ A video is already waiting for a title.\n\n"
+                    f"Telegram video ID: {existing_title_request}\n"
+                    "Please send its title first."
+                )
+            )
             return
 
         await save_title_request(
@@ -3010,7 +3221,7 @@ async def handle_video(
     await update.message.reply_text(
         "📥 Video received by the bot.\n\n"
         "Please upload the ORIGINAL video "
-        "directly into Cartoon Clip Storage."
+        f"directly into {STORAGE_CHANNEL_NAME}."
     )
 
 
@@ -3139,13 +3350,6 @@ def main():
     )
 
     bot_application.add_handler(
-        CommandHandler(
-            "publish_queue",
-            publish_queue_now
-        )
-    )
-
-    bot_application.add_handler(
         MessageHandler(
             filters.VIDEO,
             handle_video
@@ -3207,7 +3411,7 @@ def main():
     print(
         "Instagram posting interval: "
         f"{INSTAGRAM_POST_INTERVAL_SECONDS} seconds "
-        "(default 1 hour)."
+        "(configured seconds)."
     )
     print(
         "Upload reminder interval: "
