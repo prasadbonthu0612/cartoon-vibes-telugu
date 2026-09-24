@@ -26,7 +26,7 @@ from telegram.ext import (
 )
 
 from telethon import TelegramClient, events, utils
-from telethon.errors import MessageNotModifiedError
+from telethon.errors import MessageNotModifiedError, FloodWaitError
 from telethon.sessions import StringSession
 
 
@@ -60,12 +60,9 @@ INSTAGRAM_PUBLISH_START_HOUR = 6
 INSTAGRAM_PUBLISH_END_HOUR = 21
 
 # Send a reminder in the private Telegram storage channel when the bot is idle.
-# Default: every 1 hour (3600 seconds).
-# Never allow reminders more frequently than once per hour.
-UPLOAD_REMINDER_INTERVAL_SECONDS = max(
-    3600,
-    int(os.getenv("UPLOAD_REMINDER_INTERVAL_SECONDS", "3600"))
-)
+# Fixed requirement: exactly one reminder interval of at least one hour.
+# The Render environment variable cannot reduce this below one hour.
+UPLOAD_REMINDER_INTERVAL_SECONDS = 3600
 
 # Public URL used by Instagram to fetch temporary Reel videos.
 # Set this in Render to your public Render URL, for example:
@@ -318,22 +315,37 @@ async def find_storage_channel():
 # ============================================================
 
 async def safe_telethon_edit_message(entity, message_id, new_text):
-    """Edit a Telethon message without treating an unchanged edit as a failure."""
-    try:
-        await telethon_client.edit_message(
-            entity,
-            message_id,
-            new_text
-        )
-        return True
-    except MessageNotModifiedError:
-        # Telegram already contains exactly this text. This is harmless and
-        # must never abort video processing or queue publishing.
-        print(
-            f"ℹ️ Telegram message {message_id} was already up to date; "
-            "skipping unchanged edit."
-        )
-        return False
+    """
+    Edit a Telethon message safely.
+
+    Telegram can return FLOOD_WAIT when the same message is edited too often.
+    Respect the server-provided wait time and retry instead of aborting video
+    processing or queue creation.
+    """
+    while True:
+        try:
+            await telethon_client.edit_message(
+                entity,
+                message_id,
+                new_text
+            )
+            return True
+
+        except MessageNotModifiedError:
+            # Telegram already contains exactly this text. This is harmless.
+            print(
+                f"ℹ️ Telegram message {message_id} was already up to date; "
+                "skipping unchanged edit."
+            )
+            return False
+
+        except FloodWaitError as e:
+            wait_seconds = max(1, int(getattr(e, "seconds", 1)))
+            print(
+                f"⏳ Telegram edit rate limit reached for message "
+                f"{message_id}. Waiting {wait_seconds}s before retrying..."
+            )
+            await asyncio.sleep(wait_seconds + 1)
 
 
 # ============================================================
@@ -1241,9 +1253,9 @@ def progress_bar(percent, width=20):
 
 
 class TelegramProgressReporter:
-    """Edit one Telegram message at a controlled rate instead of spamming messages."""
+    """Rate-limit progress edits and never queue a backlog of Telegram edits."""
 
-    def __init__(self, bot, chat_id, message_id, min_interval=2.0):
+    def __init__(self, bot, chat_id, message_id, min_interval=10.0):
         self.bot = bot
         self.chat_id = chat_id
         self.message_id = message_id
@@ -1251,11 +1263,11 @@ class TelegramProgressReporter:
         self.last_update = 0.0
         self.last_text = None
         self.lock = asyncio.Lock()
+        self.pending_text = None
+        self.pending_force = False
+        self.pending_task = None
 
     async def edit(self, text, force=False):
-        now = time.monotonic()
-        if not force and now - self.last_update < self.min_interval:
-            return False
         if text == self.last_text:
             return False
 
@@ -1272,24 +1284,43 @@ class TelegramProgressReporter:
                     message_id=self.message_id,
                     text=text,
                 )
-                self.last_update = now
+                self.last_update = time.monotonic()
                 self.last_text = text
                 return True
             except Exception as e:
-                # Telegram can occasionally reject an edit because the text
-                # is unchanged or because of a transient API condition.
+                # Progress UI must never abort the actual video operation.
                 print(
                     f"⚠️ Progress message update failed: "
                     f"{type(e).__name__}: {str(e)}"
                 )
                 return False
 
+    async def _flush_pending(self):
+        try:
+            while self.pending_text is not None:
+                now = time.monotonic()
+                wait = self.min_interval - (now - self.last_update)
+                if wait > 0:
+                    await asyncio.sleep(wait)
+
+                text = self.pending_text
+                force = self.pending_force
+                self.pending_text = None
+                self.pending_force = False
+
+                await self.edit(text, force=force)
+        finally:
+            self.pending_task = None
+
     def schedule(self, text, force=False):
-        """Schedule an edit from synchronous Telethon/FFmpeg callbacks."""
-        now = time.monotonic()
-        if not force and now - self.last_update < self.min_interval:
-            return
-        asyncio.create_task(self.edit(text, force=force))
+        """Keep only the newest pending progress update."""
+        self.pending_text = text
+        self.pending_force = self.pending_force or force
+
+        if self.pending_task is None or self.pending_task.done():
+            self.pending_task = asyncio.create_task(
+                self._flush_pending()
+            )
 
 
 async def split_video(
@@ -1592,151 +1623,6 @@ async def append_clip_to_queue(
 # ============================================================
 # INSTAGRAM QUEUE PUBLISHER
 # ============================================================
-
-async def find_queue_manifests():
-    storage_channel = await find_storage_channel()
-
-    if storage_channel is None:
-        return []
-
-    messages = await telethon_client.get_messages(
-        storage_channel,
-        limit=200
-    )
-
-    manifests = []
-
-    for message in messages:
-        text = message.message or ""
-
-        if not text.startswith(QUEUE_MARKER):
-            continue
-
-        try:
-            json_text = text.split("\n\n", 2)[-1]
-            queue = json.loads(json_text)
-
-            manifests.append({
-                "message": message,
-                "queue": queue,
-            })
-
-        except Exception as e:
-            print(
-                f"⚠️ Could not parse queue manifest "
-                f"{message.id}: {type(e).__name__}: {str(e)}"
-            )
-
-    # Oldest queue first. A newer upload must not jump ahead of an older one.
-    manifests.sort(
-        key=lambda item: item["queue"].get("created_at", "")
-    )
-
-    return manifests
-
-
-async def save_queue_manifest(manifest_message, queue):
-    manifest_json = json.dumps(
-        queue,
-        ensure_ascii=False,
-        separators=(",", ":")
-    )
-
-    manifest_text = (
-        f"{QUEUE_MARKER}\n\n"
-        f"Cartoon Instagram Bot Queue\n\n"
-        f"{manifest_json}"
-    )
-
-    # Leave safety margin below Telegram's 4096-character text limit.
-    if len(manifest_text) > 3500:
-        raise RuntimeError(
-            "Queue manifest is unexpectedly large. "
-            "The compact queue format was not preserved."
-        )
-
-    storage_channel = await find_storage_channel()
-
-    if storage_channel is None:
-        raise RuntimeError(
-            f'Could not find "{STORAGE_CHANNEL_NAME}".'
-        )
-
-    await safe_telethon_edit_message(
-        storage_channel,
-        manifest_message.id,
-        manifest_text
-    )
-
-
-# ============================================================
-# INSTAGRAM QUEUE PUBLISHER
-# ============================================================
-
-async def find_queue_manifests():
-    storage_channel = await find_storage_channel()
-
-    if storage_channel is None:
-        return []
-
-    messages = await telethon_client.get_messages(
-        storage_channel,
-        limit=200
-    )
-
-    manifests = []
-
-    for message in messages:
-        text = message.message or ""
-
-        if not text.startswith(QUEUE_MARKER):
-            continue
-
-        try:
-            json_text = text.split("\n\n", 2)[-1]
-            queue = json.loads(json_text)
-
-            manifests.append(
-                {
-                    "message": message,
-                    "queue": queue,
-                }
-            )
-
-        except Exception as e:
-            print(
-                f"⚠️ Could not parse queue manifest "
-                f"{message.id}: {type(e).__name__}: {str(e)}"
-            )
-
-    return manifests
-
-
-async def save_queue_manifest(manifest_message, queue):
-    manifest_json = json.dumps(
-        queue,
-        ensure_ascii=False,
-        separators=(",", ":")
-    )
-
-    manifest_text = (
-        f"{QUEUE_MARKER}\n\n"
-        f"Cartoon Instagram Bot Queue\n\n"
-        f"{manifest_json}"
-    )
-
-    storage_channel = await find_storage_channel()
-
-    if storage_channel is None:
-        raise RuntimeError(
-            f'Could not find "{STORAGE_CHANNEL_NAME}".'
-        )
-
-    await safe_telethon_edit_message(
-        storage_channel,
-        manifest_message.id,
-        manifest_text
-    )
 
 
 async def publish_one_queue_clip(
@@ -2326,7 +2212,7 @@ async def instagram_queue_loop():
     Background loop for the Instagram queue.
 
     The worker checks every minute, but the persistent cooldown above
-    allows only ONE successful Reel publication every 30 minutes.
+    allows only ONE successful Reel publication every configured interval.
     The daily publishing window is temporarily disabled for testing.
     """
     await asyncio.sleep(15)
@@ -2481,7 +2367,8 @@ async def process_original_video(
             "✂️ FAST SPLITTING + UPLOADING\n\n"
             f"🎬 {title}\n\n"
             "⚡ Stream copy (no re-encoding)\n"
-            "📤 Each clip will be uploaded as soon as it is ready.",
+            "📤 Each clip will be uploaded as soon as it is ready.\n"
+            "⏳ Instagram publishing starts after ALL clips are ready.",
             force=True,
         )
 
