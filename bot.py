@@ -54,10 +54,10 @@ INSTAGRAM_POST_INTERVAL_SECONDS = int(
 )
 
 # Instagram publishing window in India Standard Time (IST).
-# Posts are allowed from 06:00 through 21:00 IST, inclusive.
+# Posts are allowed from 06:00 through 22:00 IST, inclusive.
 INSTAGRAM_TIMEZONE = ZoneInfo("Asia/Kolkata")
 INSTAGRAM_PUBLISH_START_HOUR = 6
-INSTAGRAM_PUBLISH_END_HOUR = 21
+INSTAGRAM_PUBLISH_END_HOUR = 22
 
 # Send a reminder in the private Telegram storage channel when the bot is idle.
 # Default: every 1 hour (3600 seconds).
