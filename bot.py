@@ -707,7 +707,7 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 "media_type": "REELS",
                 "video_url": public_url,
                 "caption": caption,
-                "share_to_feed": "false",
+                "share_to_feed": "true",
             }
         )
 
@@ -1268,6 +1268,74 @@ def build_instagram_caption(title, part_index, total_parts):
     )
 
 
+
+# ============================================================
+# INSTAGRAM REEL PORTRAIT FORMAT
+# ============================================================
+
+async def format_clip_for_reels(input_path, output_path):
+    """
+    Convert one already-split clip to a portrait 1080x1920 canvas.
+
+    The existing splitter remains completely unchanged and still uses
+    keyframe-aware stream copy. This step runs AFTER splitting and only
+    prepares each finished clip for Instagram:
+      - keeps the complete source video (no crop)
+      - scales it proportionally to fit inside 1080x1920
+      - centers it horizontally and vertically
+      - uses black padding for the unused portrait area
+      - preserves audio when present
+    """
+    if not os.path.isfile(input_path):
+        raise RuntimeError(f"Clip does not exist: {input_path}")
+
+    if os.path.abspath(input_path) == os.path.abspath(output_path):
+        raise RuntimeError("Portrait formatting requires a separate output file.")
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+
+    command = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-i", input_path,
+        "-map", "0:v:0",
+        "-map", "0:a:0?",
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=decrease,"
+        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-movflags", "+faststart",
+        output_path,
+    ]
+
+    print("📱 Formatting clip for Instagram portrait Reel:")
+    print(" ".join(command))
+
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+
+    if process.returncode != 0:
+        error_text = stderr.decode(errors="replace").strip()
+        raise RuntimeError(
+            "FFmpeg failed to format the clip for Instagram.\n"
+            f"{error_text[-2000:]}"
+        )
+
+    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+        raise RuntimeError(
+            "FFmpeg completed but produced no usable portrait Reel clip."
+        )
+
+    return output_path
+
+
 # ============================================================
 # SPLIT VIDEO
 # ============================================================
@@ -1399,7 +1467,7 @@ async def split_video(
     progress_reporter=None,
     title="Video",
 ):
-    """Fast keyframe-aware stream-copy splitter targeting ~60-second clips."""
+    """Fast keyframe-aware stream-copy splitter targeting ~2-minute clips."""
     os.makedirs(output_directory, exist_ok=True)
 
     # Get keyframe timestamps. No video is decoded/re-encoded.
@@ -1431,17 +1499,17 @@ async def split_video(
     if not keyframes:
         raise RuntimeError("No video keyframes were found.")
 
-    # Pick boundaries between 55 and 65 seconds, preferring 60 seconds.
+    # Pick boundaries between 105 and 120 seconds, preferring 120 seconds.
     boundaries = []
     current = 0.0
-    while duration - current > 60.0:
-        candidates = [k for k in keyframes if current + 55.0 <= k <= current + 65.0]
+    while duration - current > 120.0:
+        candidates = [k for k in keyframes if current + 105.0 <= k <= current + 120.0]
         if not candidates:
             raise RuntimeError(
-                f"No safe keyframe found between {current + 55:.1f}s and {current + 65:.1f}s. "
-                "Cannot create a safe <=65 second stream-copy clip."
+                f"No safe keyframe found between {current + 105:.1f}s and {current + 120:.1f}s. "
+                "Cannot create a safe <=120 second stream-copy clip."
             )
-        boundary = min(candidates, key=lambda k: abs(k - (current + 60.0)))
+        boundary = min(candidates, key=lambda k: abs(k - (current + 120.0)))
         boundaries.append(boundary)
         current = boundary
 
@@ -2527,8 +2595,9 @@ async def process_original_video(
         await progress_reporter.edit(
             "✂️ FAST SPLITTING + UPLOADING\n\n"
             f"🎬 {title}\n\n"
-            "⚡ Stream copy (no re-encoding)\n"
-            "📤 Each clip will be uploaded as soon as it is ready.\n"
+            "⚡ Split stage: stream copy (no re-encoding)\n"
+            "📱 Each finished clip is formatted to 1080×1920 and centered\n"
+            "📤 Then it is uploaded to Telegram immediately.\n"
             "⏳ Instagram publishing starts after ALL clips are ready.",
             force=True,
         )
@@ -2559,6 +2628,15 @@ async def process_original_video(
             final_path = os.path.join(clips_directory, filename)
             if os.path.abspath(clip_path) != os.path.abspath(final_path):
                 os.replace(clip_path, final_path)
+
+            # The splitter above stays stream-copy/fast. Only after a complete
+            # split clip exists do we prepare it for the 9:16 Instagram canvas.
+            portrait_path = os.path.join(
+                clips_directory,
+                f".portrait_part_{index:03d}.mp4",
+            )
+            await format_clip_for_reels(final_path, portrait_path)
+            os.replace(portrait_path, final_path)
 
             caption = (
                 f"{CLIP_MARKER}\n"
@@ -2624,7 +2702,7 @@ async def process_original_video(
         # segment files and upload them immediately.
         async def run_stream_splitter():
             # Find keyframes first so every non-final segment ends at a keyframe
-            # no later than 60 seconds. This preserves the fast -c copy path.
+            # no later than 120 seconds. This preserves the fast -c copy path.
             probe = [
                 "ffprobe", "-v", "error", "-skip_frame", "nokey",
                 "-select_streams", "v:0",
@@ -2655,17 +2733,17 @@ async def process_original_video(
             duration = await get_video_duration(original_path)
             boundaries = []
             current = 0.0
-            while duration - current > 60.0:
+            while duration - current > 120.0:
                 candidates = [
                     k for k in keyframes
-                    if current + 45.0 <= k <= current + 60.0
+                    if current + 105.0 <= k <= current + 120.0
                 ]
                 if not candidates:
                     raise RuntimeError(
-                        f"No safe keyframe between {current + 45:.1f}s and {current + 60:.1f}s. "
-                        "Cannot create a stream-copy clip that stays within 60 seconds."
+                        f"No safe keyframe between {current + 105:.1f}s and {current + 120:.1f}s. "
+                        "Cannot create a stream-copy clip that stays within 120 seconds."
                     )
-                boundary = min(candidates, key=lambda k: abs(k - (current + 60.0)))
+                boundary = min(candidates, key=lambda k: abs(k - (current + 120.0)))
                 boundaries.append(boundary)
                 current = boundary
 
@@ -3906,7 +3984,7 @@ async def settings_command(update, context):
             f"Publish failed: {'ON' if n.get('publish_failed', True) else 'OFF'}\n"
             f"Queue complete: {'ON' if n.get('queue_complete', True) else 'OFF'}\n\n"
             "🌏 Timezone: Asia/Kolkata (IST)\n"
-            "✂️ Splitter: 60-second keyframe-aware stream copy\n"
+            "✂️ Splitter: ~2-minute keyframe-aware stream copy\n"
             "📦 Telegram transfer: 512 KB chunks"
         )
     except Exception as e:
