@@ -16,7 +16,7 @@ from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from telegram import Update
+from telegram import Update, BotCommand
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -54,14 +54,15 @@ INSTAGRAM_POST_INTERVAL_SECONDS = int(
 )
 
 # Instagram publishing window in India Standard Time (IST).
-# Posts are allowed from 06:00 through 21:00 IST, inclusive.
+# Default is disabled to preserve the existing 24/7 test behavior.
+# Use /window 06:00 21:00 to enable a publishing window.
 INSTAGRAM_TIMEZONE = ZoneInfo("Asia/Kolkata")
 INSTAGRAM_PUBLISH_START_HOUR = 6
 INSTAGRAM_PUBLISH_END_HOUR = 21
 
 # Send a reminder in the private Telegram storage channel when the bot is idle.
-# Fixed requirement: exactly one reminder interval of at least one hour.
-# The Render environment variable cannot reduce this below one hour.
+# Default is one hour; Telegram command /reminder can increase it.
+# The interval is never allowed below one hour.
 UPLOAD_REMINDER_INTERVAL_SECONDS = 3600
 
 # Public URL used by Instagram to fetch temporary Reel videos.
@@ -98,6 +99,29 @@ bot_application = None
 
 admin_chat_id = None
 pending_video_message_id = None
+
+# Persistent Telegram-controlled bot settings.
+DEFAULT_BOT_SETTINGS = {
+    "window_enabled": False,
+    "window_start_minutes": 6 * 60,
+    "window_end_minutes": 21 * 60,
+    "interval_seconds": INSTAGRAM_POST_INTERVAL_SECONDS,
+    "reminder_seconds": 3600,
+    "publishing_paused": False,
+    "notifications": {
+        "processing_complete": True,
+        "processing_failed": True,
+        "published": True,
+        "publish_failed": True,
+        "queue_complete": True,
+        "upload_reminder": True,
+    },
+}
+
+bot_settings = json.loads(json.dumps(DEFAULT_BOT_SETTINGS))
+
+# The task currently processing an original video, if any.
+current_processing_task = None
 
 # Temporary public media registry.
 # token -> {"path": local_file_path, "content_type": "video/mp4"}
@@ -349,23 +373,124 @@ async def safe_telethon_edit_message(entity, message_id, new_text):
 
 
 # ============================================================
-# SAVE ADMIN CHAT ID
+# PERSISTENT BOT CONFIGURATION
 # ============================================================
 
-async def save_admin_chat_id(chat_id):
+def _default_bot_settings():
+    return json.loads(json.dumps(DEFAULT_BOT_SETTINGS))
 
+
+def _apply_bot_settings(settings):
+    """Apply persisted Telegram-controlled settings to runtime globals."""
+    global INSTAGRAM_POST_INTERVAL_SECONDS
+    global UPLOAD_REMINDER_INTERVAL_SECONDS
+    global INSTAGRAM_PUBLISH_START_HOUR
+    global INSTAGRAM_PUBLISH_END_HOUR
+
+    merged = _default_bot_settings()
+    if isinstance(settings, dict):
+        for key in (
+            "window_enabled",
+            "window_start_minutes",
+            "window_end_minutes",
+            "interval_seconds",
+            "reminder_seconds",
+            "publishing_paused",
+        ):
+            if key in settings:
+                merged[key] = settings[key]
+
+        saved_notifications = settings.get("notifications")
+        if isinstance(saved_notifications, dict):
+            merged["notifications"].update(saved_notifications)
+
+    try:
+        merged["window_start_minutes"] = int(merged["window_start_minutes"]) % (24 * 60)
+        merged["window_end_minutes"] = int(merged["window_end_minutes"]) % (24 * 60)
+        merged["interval_seconds"] = max(60, int(merged["interval_seconds"]))
+        merged["reminder_seconds"] = max(3600, int(merged["reminder_seconds"]))
+    except (TypeError, ValueError):
+        merged = _default_bot_settings()
+
+    bot_settings.clear()
+    bot_settings.update(merged)
+
+    INSTAGRAM_POST_INTERVAL_SECONDS = merged["interval_seconds"]
+    UPLOAD_REMINDER_INTERVAL_SECONDS = merged["reminder_seconds"]
+
+    start_minutes = merged["window_start_minutes"]
+    end_minutes = merged["window_end_minutes"]
+    INSTAGRAM_PUBLISH_START_HOUR = start_minutes // 60
+    INSTAGRAM_PUBLISH_END_HOUR = end_minutes // 60
+
+    return merged
+
+
+async def load_bot_config():
+    """Load persistent bot settings from the single CONFIG_MARKER message."""
     global admin_chat_id
 
-    admin_chat_id = chat_id
+    storage_channel = await find_storage_channel()
+    if storage_channel is None:
+        return _apply_bot_settings(bot_settings)
 
-    storage_channel = (
-        await find_storage_channel()
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=100
     )
 
-    if storage_channel is None:
+    for message in messages:
+        text = message.message or ""
+        if not text.startswith(CONFIG_MARKER):
+            continue
 
+        try:
+            config = json.loads(text.split("\n", 1)[1])
+
+            if config.get("admin_chat_id") is not None:
+                admin_chat_id = config.get("admin_chat_id")
+
+            saved_settings = config.get("settings", {})
+            if isinstance(saved_settings, dict):
+                return _apply_bot_settings(saved_settings)
+
+        except Exception as e:
+            print(
+                f"⚠️ Could not load bot configuration from message "
+                f"{message.id}: {type(e).__name__}: {str(e)}"
+            )
+
+    return _apply_bot_settings(bot_settings)
+
+
+async def save_bot_config():
+    """Persist admin ID and all Telegram-controlled settings in one message."""
+    storage_channel = await find_storage_channel()
+
+    if storage_channel is None:
         raise RuntimeError(
             f'Could not find "{STORAGE_CHANNEL_NAME}".'
+        )
+
+    config = {
+        "admin_chat_id": admin_chat_id,
+        "settings": bot_settings,
+    }
+
+    config_json = json.dumps(
+        config,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+    config_text = (
+        f"{CONFIG_MARKER}\n"
+        f"{config_json}"
+    )
+
+    if len(config_text) > 3500:
+        raise RuntimeError(
+            "Bot configuration unexpectedly exceeded Telegram message limits."
         )
 
     messages = await telethon_client.get_messages(
@@ -374,44 +499,14 @@ async def save_admin_chat_id(chat_id):
     )
 
     for message in messages:
-
         text = message.message or ""
-
         if text.startswith(CONFIG_MARKER):
-
-            try:
-
-                config = json.loads(
-                    text.split("\n", 1)[1]
-                )
-
-                old_chat_id = config.get(
-                    "admin_chat_id"
-                )
-
-                if old_chat_id == chat_id:
-                    return
-
-                new_text = (
-                    f"{CONFIG_MARKER}\n"
-                    f"{json.dumps({'admin_chat_id': chat_id})}"
-                )
-
-                await safe_telethon_edit_message(
-                    storage_channel,
-                    message.id,
-                    new_text
-                )
-
-                return
-
-            except Exception:
-                pass
-
-    config_text = (
-        f"{CONFIG_MARKER}\n"
-        f"{json.dumps({'admin_chat_id': chat_id})}"
-    )
+            await safe_telethon_edit_message(
+                storage_channel,
+                message.id,
+                config_text
+            )
+            return
 
     await telethon_client.send_message(
         storage_channel,
@@ -419,52 +514,21 @@ async def save_admin_chat_id(chat_id):
     )
 
 
-# ============================================================
-# LOAD ADMIN CHAT ID
-# ============================================================
+async def save_admin_chat_id(chat_id):
+    global admin_chat_id
+
+    admin_chat_id = chat_id
+    await save_bot_config()
+
 
 async def load_admin_chat_id():
-
     global admin_chat_id
 
     if admin_chat_id:
         return admin_chat_id
 
-    storage_channel = (
-        await find_storage_channel()
-    )
-
-    if storage_channel is None:
-        return None
-
-    messages = await telethon_client.get_messages(
-        storage_channel,
-        limit=100
-    )
-
-    for message in messages:
-
-        text = message.message or ""
-
-        if not text.startswith(CONFIG_MARKER):
-            continue
-
-        try:
-
-            config = json.loads(
-                text.split("\n", 1)[1]
-            )
-
-            admin_chat_id = config.get(
-                "admin_chat_id"
-            )
-
-            return admin_chat_id
-
-        except Exception:
-            continue
-
-    return None
+    await load_bot_config()
+    return admin_chat_id
 
 
 # ============================================================
@@ -740,6 +804,9 @@ async def test_instagram(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not await command_is_admin(update):
+        return
+
     """
     Verify the Instagram access token and Instagram User ID.
     The token itself is never sent to Telegram.
@@ -830,6 +897,9 @@ async def test_telegram(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+    if not await command_is_admin(update):
+        return
+
 
     try:
 
@@ -1939,6 +2009,18 @@ async def _process_pending_queues():
         print("⚠️ PUBLIC_BASE_URL is missing. Queue publisher is disabled.")
         return
 
+    if bot_settings.get("publishing_paused", False):
+        print("⏸️ Instagram publishing is paused.")
+        return
+
+    if not window_allows_now():
+        print(
+            "🕐 Instagram publishing is outside the configured window. "
+            f"Window: {format_clock_minutes(bot_settings.get('window_start_minutes', 360))} "
+            f"– {format_clock_minutes(bot_settings.get('window_end_minutes', 1260))} IST."
+        )
+        return
+
     manifests = await find_queue_manifests()
 
     last_publish = await get_last_successful_instagram_publish_time(manifests)
@@ -1997,16 +2079,15 @@ async def _process_pending_queues():
             if next_index > total:
                 queue["status"] = "COMPLETED"
                 await save_queue_manifest(manifest_message, queue)
-                if admin_chat_id:
-                    await bot_application.bot.send_message(
-                        chat_id=admin_chat_id,
-                        text=(
-                            "🎉 INSTAGRAM QUEUE COMPLETE!\n\n"
-                            f"🎬 {queue.get('title', 'Cartoon')}\n"
-                            f"📤 Published: {total}\n"
-                            "🗑️ Successfully published clips were removed from Telegram."
-                        )
+                await send_admin_notification(
+                    "queue_complete",
+                    (
+                        "🎉 INSTAGRAM QUEUE COMPLETE!\n\n"
+                        f"🎬 {queue.get('title', 'Cartoon')}\n"
+                        f"📤 Published: {total}\n"
+                        "🗑️ Successfully published clips were removed from Telegram."
                     )
+                )
                 continue
 
             clip_message_ids = queue.get("clip_message_ids", [])
@@ -2047,21 +2128,20 @@ async def _process_pending_queues():
 
                 await save_queue_manifest(manifest_message, queue)
 
-                if admin_chat_id:
-                    await bot_application.bot.send_message(
-                        chat_id=admin_chat_id,
-                        text=(
-                            "✅ INSTAGRAM REEL PUBLISHED!\n\n"
-                            f"🎬 {title}\n"
-                            f"📌 Part: {next_index}/{total}\n"
-                            f"🆔 Instagram Media ID: {media_id}\n\n"
-                            + (
-                                "🗑️ Telegram clip deleted after successful publishing."
-                                if clip.get("deleted_from_telegram")
-                                else "⚠️ Instagram published successfully, but Telegram cleanup failed."
-                            )
+                await send_admin_notification(
+                    "published",
+                    (
+                        "✅ INSTAGRAM REEL PUBLISHED!\n\n"
+                        f"🎬 {title}\n"
+                        f"📌 Part: {next_index}/{total}\n"
+                        f"🆔 Instagram Media ID: {media_id}\n\n"
+                        + (
+                            "🗑️ Telegram clip deleted after successful publishing."
+                            if clip.get("deleted_from_telegram")
+                            else "⚠️ Instagram published successfully, but Telegram cleanup failed."
                         )
                     )
+                )
                 return
 
             except Exception as e:
@@ -2096,21 +2176,20 @@ async def _process_pending_queues():
                     f"Retry backoff: {retry_seconds}s."
                 )
 
-                if admin_chat_id:
-                    await bot_application.bot.send_message(
-                        chat_id=admin_chat_id,
-                        text=(
-                            "❌ INSTAGRAM REEL PUBLISH FAILED\n\n"
-                            f"🎬 {title}\n"
-                            f"📌 Part: {next_index}/{total}\n"
-                            f"Error: {type(e).__name__}\n"
-                            f"{error_text}\n\n"
-                            "⚠️ The Telegram clip was NOT deleted.\n"
-                            f"⏳ Automatic retry is delayed for "
-                            f"{retry_seconds // 3600 if retry_seconds >= 3600 else retry_seconds // 60}"
-                            f"{' hours' if retry_seconds >= 3600 else ' minutes'}."
-                        )
+                await send_admin_notification(
+                    "publish_failed",
+                    (
+                        "❌ INSTAGRAM REEL PUBLISH FAILED\n\n"
+                        f"🎬 {title}\n"
+                        f"📌 Part: {next_index}/{total}\n"
+                        f"Error: {type(e).__name__}\n"
+                        f"{error_text}\n\n"
+                        "⚠️ The Telegram clip was NOT deleted.\n"
+                        f"⏳ Automatic retry is delayed for "
+                        f"{retry_seconds // 3600 if retry_seconds >= 3600 else retry_seconds // 60}"
+                        f"{' hours' if retry_seconds >= 3600 else ' minutes'}."
                     )
+                )
                 return
 
         # Legacy queue compatibility.
@@ -2140,21 +2219,20 @@ async def _process_pending_queues():
             if queue["next_clip_index"] > queue.get("total_clips", len(clips)):
                 queue["status"] = "COMPLETED"
             await save_queue_manifest(manifest_message, queue)
-            if admin_chat_id:
-                await bot_application.bot.send_message(
-                    chat_id=admin_chat_id,
-                    text=(
-                        "✅ INSTAGRAM REEL PUBLISHED!\n\n"
-                        f"🎬 {queue.get('title', 'Cartoon')}\n"
-                        f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n"
-                        f"🆔 Instagram Media ID: {media_id}\n\n"
-                        + (
-                            "🗑️ Telegram clip deleted after successful publishing."
-                            if target_clip.get("deleted_from_telegram")
-                            else "⚠️ Instagram published successfully, but Telegram cleanup failed."
-                        )
+            await send_admin_notification(
+                "published",
+                (
+                    "✅ INSTAGRAM REEL PUBLISHED!\n\n"
+                    f"🎬 {queue.get('title', 'Cartoon')}\n"
+                    f"📌 Part: {clip_index}/{queue.get('total_clips', len(clips))}\n"
+                    f"🆔 Instagram Media ID: {media_id}\n\n"
+                    + (
+                        "🗑️ Telegram clip deleted after successful publishing."
+                        if target_clip.get("deleted_from_telegram")
+                        else "⚠️ Instagram published successfully, but Telegram cleanup failed."
                     )
                 )
+            )
             return
         except Exception as e:
             target_clip["status"] = "FAILED"
@@ -2250,7 +2328,10 @@ async def storage_channel_is_idle(manifests):
 
 
 async def maybe_send_upload_reminder(manifests):
-    """Send an upload prompt to the private storage channel every hour while idle."""
+    """Send an upload prompt to the private storage channel on the configured schedule."""
+    if not bot_settings.get("notifications", {}).get("upload_reminder", True):
+        return
+
     if not await storage_channel_is_idle(manifests):
         return
 
@@ -2716,10 +2797,24 @@ async def process_original_video(
             force=True,
         )
 
-    except Exception as e:
+        await send_admin_notification(
+            "processing_complete",
+            (
+                "✅ VIDEO PROCESSING COMPLETE!\n\n"
+                f"🎬 {title}\n"
+                f"✂️ Parts created: {len(uploaded_messages)}\n"
+                "📋 Instagram queue created and ready."
+            )
+        )
+
+    except (Exception, asyncio.CancelledError) as e:
+
+        was_cancelled = isinstance(e, asyncio.CancelledError)
 
         print(
-            "❌ VIDEO PROCESSING FAILED"
+            "🛑 VIDEO PROCESSING CANCELLED"
+            if was_cancelled
+            else "❌ VIDEO PROCESSING FAILED"
         )
 
         print(
@@ -2766,21 +2861,36 @@ async def process_original_video(
             pass
 
         try:
-            await bot_application.bot.send_message(
-                chat_id=admin_chat_id,
-                text=(
-                    "❌ VIDEO PROCESSING FAILED\n\n"
-                    f"🎬 {title}\n\n"
-                    f"Error: {type(e).__name__}\n"
-                    f"{str(e)}\n\n"
-                    "⚠️ The original video was NOT deleted.\n"
-                    f"Your video is still safe in {STORAGE_CHANNEL_NAME}.\n\n"
-                    + (
-                        "Generated partial clips from this failed processing "
-                        "attempt were cleaned up."
-                        if not processing_complete
-                        else "The completed Instagram queue was preserved."
+            await send_admin_notification(
+                "processing_complete" if was_cancelled else "processing_failed",
+                (
+                    (
+                        "🛑 VIDEO PROCESSING CANCELLED\n\n"
+                        f"🎬 {title}\n\n"
+                        "⚠️ The original video was NOT deleted.\n"
+                        f"Your video is still safe in {STORAGE_CHANNEL_NAME}.\n\n"
                     )
+                    if was_cancelled
+                    else
+                    (
+                        "❌ VIDEO PROCESSING FAILED\n\n"
+                        f"🎬 {title}\n\n"
+                        f"Error: {type(e).__name__}\n"
+                        f"{str(e)}\n\n"
+                        "⚠️ The original video was NOT deleted.\n"
+                        f"Your video is still safe in {STORAGE_CHANNEL_NAME}.\n\n"
+                    )
+                )
+                + (
+                    "Generated partial clips from this cancelled processing "
+                    "attempt were cleaned up."
+                    if was_cancelled and not processing_complete
+                    else
+                    "Generated partial clips from this failed processing "
+                    "attempt were cleaned up."
+                    if not was_cancelled and not processing_complete
+                    else
+                    "The completed Instagram queue was preserved."
                 )
             )
         except Exception as notify_error:
@@ -2962,8 +3072,8 @@ async def handle_title(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
-
     global pending_video_message_id
+    global current_processing_task
 
     if not update.message:
         return
@@ -2992,30 +3102,17 @@ async def handle_title(
     )
 
     if not video_message_id:
-
         await update.message.reply_text(
             "ℹ️ I don't have a video waiting "
             "for a title."
         )
-
         return
 
-    pending_video_message_id = (
-        video_message_id
-    )
+    pending_video_message_id = video_message_id
 
-    print(
-        "🎬 TITLE RECEIVED"
-    )
-
-    print(
-        f"Title: {title}"
-    )
-
-    print(
-        f"Video message ID: "
-        f"{video_message_id}"
-    )
+    print("🎬 TITLE RECEIVED")
+    print(f"Title: {title}")
+    print(f"Video message ID: {video_message_id}")
 
     await update.message.reply_text(
         "✅ Title received!\n\n"
@@ -3023,15 +3120,1018 @@ async def handle_title(
         "🚀 Starting automatic processing..."
     )
 
-    # Start processing.
-    #
-    # We await it here so the job is tracked by
-    # the Telegram bot event loop.
-    await process_original_video(
-        video_message_id,
-        title,
-        chat_id
+    current_processing_task = asyncio.current_task()
+
+    try:
+        await process_original_video(
+            video_message_id,
+            title,
+            chat_id
+        )
+    finally:
+        if current_processing_task is asyncio.current_task():
+            current_processing_task = None
+
+
+
+# ============================================================
+# TELEGRAM CONTROL COMMANDS
+# ============================================================
+
+async def command_is_admin(update):
+    if not update or not update.effective_chat:
+        return False
+    return await load_admin_chat_id() == update.effective_chat.id
+
+
+def format_clock_minutes(total_minutes):
+    total_minutes = int(total_minutes) % 1440
+    hour, minute = divmod(total_minutes, 60)
+    suffix = "AM" if hour < 12 else "PM"
+    display_hour = hour % 12 or 12
+    return f"{display_hour:02d}:{minute:02d} {suffix}"
+
+
+def format_duration_human(seconds):
+    seconds = max(0, int(seconds))
+    if seconds % 3600 == 0:
+        return f"{seconds // 3600}h"
+    if seconds % 60 == 0:
+        minutes = seconds // 60
+        if minutes >= 60:
+            h, m = divmod(minutes, 60)
+            return f"{h}h {m}m" if m else f"{h}h"
+        return f"{minutes}m"
+    m, s = divmod(seconds, 60)
+    return f"{m}m {s}s"
+
+
+def parse_clock(value):
+    match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", value.strip())
+    if not match:
+        raise ValueError("Use HH:MM, for example 06:00 or 21:00.")
+    return int(match.group(1)) * 60 + int(match.group(2))
+
+
+def parse_duration(value, minimum_seconds=60):
+    value = value.strip().lower().replace(" ", "")
+    if value.isdigit():
+        seconds = int(value)
+    else:
+        matches = re.findall(r"(\d+)([smhd])", value)
+        if not matches or "".join(n + u for n, u in matches) != value:
+            raise ValueError("Use 30m, 1h, 90m, or 1h30m.")
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}
+        seconds = sum(int(n) * mult[u] for n, u in matches)
+    if seconds < minimum_seconds:
+        raise ValueError(
+            f"Minimum is {format_duration_human(minimum_seconds)}."
+        )
+    return seconds
+
+
+def window_allows_now(now=None):
+    if not bot_settings.get("window_enabled", True):
+        return True
+    now = now or datetime.now(INSTAGRAM_TIMEZONE)
+    current = now.hour * 60 + now.minute
+    start = int(bot_settings.get("window_start_minutes", 360))
+    end = int(bot_settings.get("window_end_minutes", 1260))
+    if start == end:
+        return True
+    if start < end:
+        return start <= current <= end
+    return current >= start or current <= end
+
+
+def next_window_start(now=None):
+    now = now or datetime.now(INSTAGRAM_TIMEZONE)
+    if not bot_settings.get("window_enabled", True):
+        return now
+
+    start = int(bot_settings.get("window_start_minutes", 360))
+    end = int(bot_settings.get("window_end_minutes", 1260))
+    current = now.hour * 60 + now.minute
+
+    if start == end:
+        return now
+
+    if start < end:
+        if start <= current <= end:
+            return now
+        date_value = now.date() if current < start else now.date() + timedelta(days=1)
+    else:
+        if current >= start or current <= end:
+            return now
+        date_value = now.date() + timedelta(days=1)
+
+    return datetime(
+        date_value.year, date_value.month, date_value.day,
+        start // 60, start % 60,
+        tzinfo=INSTAGRAM_TIMEZONE
     )
+
+
+def next_publish_time_from_state(last_publish=None):
+    if bot_settings.get("publishing_paused"):
+        return None
+
+    now = datetime.now(INSTAGRAM_TIMEZONE)
+    candidate = now
+
+    if last_publish is not None:
+        if last_publish.tzinfo is None:
+            last_publish = last_publish.replace(tzinfo=timezone.utc)
+        candidate = (
+            last_publish + timedelta(seconds=INSTAGRAM_POST_INTERVAL_SECONDS)
+        ).astimezone(INSTAGRAM_TIMEZONE)
+
+    return max(candidate, next_window_start(candidate))
+
+
+async def send_admin_notification(kind, text):
+    if not admin_chat_id:
+        return
+    if not bot_settings.get("notifications", {}).get(kind, True):
+        return
+    try:
+        await bot_application.bot.send_message(
+            chat_id=admin_chat_id,
+            text=text
+        )
+    except Exception as e:
+        print(
+            f"⚠️ Could not send {kind} notification: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+
+
+def queue_summary(queue):
+    total = int(queue.get("total_clips", 0))
+    skipped = len(queue.get("skipped_parts", []))
+
+    if queue.get("queue_version") == 2 and "clip_message_ids" in queue:
+        processed = max(
+            0,
+            min(total, int(queue.get("next_clip_index", 1)) - 1)
+        )
+        published = max(0, processed - skipped)
+    else:
+        clips = queue.get("clips", [])
+        published = sum(
+            1 for clip in clips
+            if clip.get("instagram_status") == "PUBLISHED"
+        )
+        skipped = sum(
+            1 for clip in clips
+            if clip.get("instagram_status") == "SKIPPED"
+        )
+
+    waiting = max(0, total - published - skipped)
+    return published, waiting, total
+
+
+async def help_command(update, context):
+    if not await command_is_admin(update):
+        return
+    await update.message.reply_text(
+        "🤖 CARTOON VIBES TELUGU BOT\n\n"
+        "📊 INFO\n"
+        "/status — complete status\n"
+        "/queue — all pending queues\n"
+        "/next — next Reel\n"
+        "/history — completed videos\n"
+        "/jobs — active jobs\n"
+        "/storage — Telegram storage\n\n"
+        "⚙️ INSTAGRAM\n"
+        "/window — publishing window\n"
+        "/interval — Reel interval\n"
+        "/pause — pause publishing\n"
+        "/resume — resume publishing\n"
+        "/retry — retry failed Reel\n"
+        "/skip — skip next Reel\n"
+        "/quota — Meta publishing quota\n"
+        "/publish_queue — run queue check now\n\n"
+        "🔔 NOTIFICATIONS\n"
+        "/reminder — upload reminder\n"
+        "/notifications — notification controls\n\n"
+        "🛠️ SYSTEM\n"
+        "/settings — all settings\n"
+        "/test_telegram — Telegram test\n"
+        "/test_instagram — Instagram test\n"
+        "/test_public_url — public URL test\n"
+        "/cancel — cancel current processing\n"
+        "/clear_completed — clean completed manifests\n\n"
+        "Examples:\n"
+        "/window 06:00 21:00\n"
+        "/window off\n"
+        "/interval 1h\n"
+        "/reminder 2h\n"
+        "/notifications published off\n"
+        "/skip confirm\n"
+        "/clear_completed confirm"
+    )
+
+
+async def status_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        await load_bot_config()
+        processing = await load_processing_state()
+        manifests = await find_queue_manifests()
+
+        pending = []
+        waiting_clips = 0
+        for item in manifests:
+            q = item["queue"]
+            if q.get("status") == "COMPLETED":
+                continue
+            pub, wait, total = queue_summary(q)
+            waiting_clips += wait
+            pending.append((q, pub, wait, total))
+
+        telegram_ok = bool(telethon_client and telethon_client.is_connected())
+        instagram_ok = bool(INSTAGRAM_ACCESS_TOKEN and INSTAGRAM_USER_ID)
+        public_ok = bool(PUBLIC_BASE_URL)
+
+        last_publish = await get_last_successful_instagram_publish_time(manifests)
+        next_time = next_publish_time_from_state(last_publish)
+
+        if bot_settings.get("publishing_paused"):
+            publish_state = "⏸️ PAUSED"
+            next_text = "Paused"
+        elif not window_allows_now():
+            publish_state = "🕐 OUTSIDE WINDOW"
+            next_text = (
+                next_time.strftime("%I:%M %p IST")
+                if next_time else "Not scheduled"
+            )
+        else:
+            publish_state = "🟢 ACTIVE"
+            next_text = (
+                next_time.strftime("%I:%M %p IST")
+                if next_time else "Ready"
+            )
+
+        lines = [
+            "📊 BOT STATUS",
+            "",
+            "🟢 Bot: ONLINE",
+            f"{'🟢' if telegram_ok else '🔴'} Telegram/Telethon: "
+            f"{'CONNECTED' if telegram_ok else 'NOT CONNECTED'}",
+            f"{'🟢' if instagram_ok else '🔴'} Instagram: "
+            f"{'CONFIGURED' if instagram_ok else 'MISSING'}",
+            f"{'🟢' if public_ok else '🔴'} Public URL: "
+            f"{'CONFIGURED' if public_ok else 'MISSING'}",
+            "",
+            "🎬 PROCESSING",
+        ]
+
+        if processing:
+            lines += [
+                f"Current: {processing.get('title', 'Unknown')}",
+                f"Video ID: {processing.get('video_message_id', 'Unknown')}",
+            ]
+        else:
+            lines.append("Current: None")
+
+        lines += [
+            "",
+            "📋 QUEUE",
+            f"Pending videos: {len(pending)}",
+            f"Clips waiting: {waiting_clips}",
+            "",
+            "📤 INSTAGRAM",
+            f"Publishing: {publish_state}",
+            f"Interval: {format_duration_human(INSTAGRAM_POST_INTERVAL_SECONDS)}",
+            "Window: " + (
+                f"{format_clock_minutes(bot_settings['window_start_minutes'])} – "
+                f"{format_clock_minutes(bot_settings['window_end_minutes'])} IST"
+                if bot_settings.get("window_enabled")
+                else "24/7"
+            ),
+            f"Next allowed: {next_text}",
+            "",
+            "🔔 REMINDER",
+            f"Every: {format_duration_human(UPLOAD_REMINDER_INTERVAL_SECONDS)}",
+        ]
+
+        if pending:
+            q, pub, wait, total = pending[0]
+            lines += [
+                "",
+                "➡️ NEXT QUEUE",
+                f"{q.get('title', 'Untitled')}",
+                f"Progress: {pub}/{total}",
+                f"Next part: {q.get('next_clip_index', pub + 1)}",
+            ]
+
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ STATUS CHECK FAILED\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def queue_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        manifests = await find_queue_manifests()
+        active = [
+            item for item in manifests
+            if item["queue"].get("status") != "COMPLETED"
+        ]
+        if not active:
+            await update.message.reply_text(
+                "📋 QUEUE IS EMPTY\n\nNo pending Instagram queues."
+            )
+            return
+
+        lines = ["📋 INSTAGRAM QUEUES", ""]
+        for i, item in enumerate(active, 1):
+            q = item["queue"]
+            pub, wait, total = queue_summary(q)
+            lines += [
+                f"{i}️⃣ {q.get('title', 'Untitled')}",
+                f"   Status: {q.get('status', 'PENDING')}",
+                f"   Processing complete: "
+                f"{'YES' if q.get('processing_complete') else 'NO'}",
+                f"   Published: {pub}/{total}",
+                f"   Skipped: {len(q.get('skipped_parts', []))}",
+                f"   Waiting: {wait}",
+                f"   Next part: {q.get('next_clip_index', pub + 1) if wait else 'None'}",
+            ]
+            if q.get("retry_after"):
+                lines.append(f"   Retry after: {q['retry_after']}")
+            lines.append("")
+
+        lines.append(f"Pending queues: {len(active)}")
+        reply_text = "\n".join(lines)
+        if len(reply_text) > 3500:
+            reply_text = reply_text[:3500] + "\n\n…output truncated…"
+        await update.message.reply_text(reply_text)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not read queues.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def next_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        manifests = await find_queue_manifests()
+        target = None
+        for item in manifests:
+            q = item["queue"]
+            if q.get("status") == "COMPLETED" or not q.get("processing_complete"):
+                continue
+            pub, wait, total = queue_summary(q)
+            if wait:
+                target = (q, pub, total)
+                break
+
+        if target is None:
+            await update.message.reply_text(
+                "📤 NEXT REEL\n\nNo ready queued Reel."
+            )
+            return
+
+        q, pub, total = target
+        last_publish = await get_last_successful_instagram_publish_time(manifests)
+        next_time = next_publish_time_from_state(last_publish)
+
+        if q.get("retry_after"):
+            try:
+                retry_time = datetime.fromisoformat(
+                    q["retry_after"].replace("Z", "+00:00")
+                ).astimezone(INSTAGRAM_TIMEZONE)
+                if retry_time > datetime.now(INSTAGRAM_TIMEZONE):
+                    next_time = retry_time
+            except Exception:
+                pass
+
+        next_text = (
+            "Paused"
+            if bot_settings.get("publishing_paused")
+            else next_time.strftime("%I:%M %p IST") if next_time else "Ready"
+        )
+
+        await update.message.reply_text(
+            "📤 NEXT INSTAGRAM REEL\n\n"
+            f"🎬 {q.get('title', 'Untitled')}\n"
+            f"📌 Part: {q.get('next_clip_index', pub + 1)}/{total}\n"
+            f"📊 Published: {pub}/{total}\n"
+            f"⏱️ Next allowed: {next_text}\n"
+            "🕐 Window: " + (
+                f"{format_clock_minutes(bot_settings['window_start_minutes'])} – "
+                f"{format_clock_minutes(bot_settings['window_end_minutes'])} IST"
+                if bot_settings.get("window_enabled") else "24/7"
+            )
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not determine next Reel.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def history_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        manifests = await find_queue_manifests()
+        completed = [
+            item for item in manifests
+            if item["queue"].get("status") == "COMPLETED"
+        ]
+        completed.sort(
+            key=lambda x: x["queue"].get("last_published_at")
+            or x["queue"].get("created_at", ""),
+            reverse=True
+        )
+
+        if not completed:
+            await update.message.reply_text(
+                "📜 HISTORY\n\nNo completed queues yet."
+            )
+            return
+
+        lines = ["📜 RECENT HISTORY", ""]
+        for i, item in enumerate(completed[:10], 1):
+            q = item["queue"]
+            pub, _, total = queue_summary(q)
+            skipped = len(q.get("skipped_parts", []))
+            lines += [
+                f"{i}. {q.get('title', 'Untitled')}",
+                f"   Published: {pub}/{total}",
+                f"   Skipped: {skipped}",
+                f"   Last activity: {q.get('last_published_at', 'Unknown')}",
+                "",
+            ]
+        await update.message.reply_text("\n".join(lines))
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not read history.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def window_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        args = context.args
+        if not args:
+            await update.message.reply_text(
+                "🕐 PUBLISHING WINDOW\n\n" + (
+                    f"Start: {format_clock_minutes(bot_settings['window_start_minutes'])}\n"
+                    f"End: {format_clock_minutes(bot_settings['window_end_minutes'])}\n"
+                    "Timezone: Asia/Kolkata (IST)\n"
+                    "Status: ENABLED"
+                    if bot_settings.get("window_enabled")
+                    else "Status: DISABLED (24/7)"
+                )
+            )
+            return
+
+        if len(args) == 1 and args[0].lower() in {"off", "disable", "disabled"}:
+            bot_settings["window_enabled"] = False
+            await save_bot_config()
+            await update.message.reply_text(
+                "✅ Publishing window disabled.\n\nInstagram publishing is now allowed 24/7."
+            )
+            return
+
+        if len(args) != 2:
+            raise ValueError("Use /window 06:00 21:00 or /window off.")
+
+        start_minutes = parse_clock(args[0])
+        end_minutes = parse_clock(args[1])
+        if start_minutes == end_minutes:
+            raise ValueError("Start and end cannot be identical. Use /window off for 24/7.")
+
+        bot_settings["window_enabled"] = True
+        bot_settings["window_start_minutes"] = start_minutes
+        bot_settings["window_end_minutes"] = end_minutes
+        _apply_bot_settings(bot_settings)
+        await save_bot_config()
+
+        await update.message.reply_text(
+            "✅ PUBLISHING WINDOW UPDATED\n\n"
+            f"Start: {format_clock_minutes(start_minutes)}\n"
+            f"End: {format_clock_minutes(end_minutes)}\n"
+            "Timezone: Asia/Kolkata (IST)"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Window not changed.\n\n{str(e)}")
+
+
+async def interval_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        if not context.args:
+            await update.message.reply_text(
+                "⏱️ INSTAGRAM POST INTERVAL\n\n"
+                f"Current: {format_duration_human(INSTAGRAM_POST_INTERVAL_SECONDS)}\n"
+                f"Seconds: {INSTAGRAM_POST_INTERVAL_SECONDS}"
+            )
+            return
+
+        seconds = parse_duration(context.args[0], 60)
+        bot_settings["interval_seconds"] = seconds
+        _apply_bot_settings(bot_settings)
+        await save_bot_config()
+
+        await update.message.reply_text(
+            "✅ INTERVAL UPDATED\n\n"
+            f"Interval: {format_duration_human(seconds)}"
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Interval not changed.\n\n{str(e)}")
+
+
+async def quota_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        if not INSTAGRAM_ACCESS_TOKEN or not INSTAGRAM_USER_ID:
+            await update.message.reply_text("❌ Instagram credentials are missing.")
+            return
+
+        await update.message.reply_text("🔎 Checking Instagram publishing quota...")
+        status_code, data = instagram_api_get(
+            f"{INSTAGRAM_USER_ID}/content_publishing_limit"
+        )
+        pretty = json.dumps(data, ensure_ascii=False, indent=2)
+        if len(pretty) > 3000:
+            pretty = pretty[:3000] + "\n..."
+
+        await update.message.reply_text(
+            "📊 INSTAGRAM PUBLISHING QUOTA\n\n"
+            f"HTTP status: {status_code}\n\n{pretty}"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ COULD NOT READ INSTAGRAM QUOTA\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def pause_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        bot_settings["publishing_paused"] = True
+        await save_bot_config()
+        await update.message.reply_text(
+            "⏸️ INSTAGRAM PUBLISHING PAUSED\n\n"
+            "Video processing and Telegram clip uploads continue normally.\n"
+            "Use /resume to continue."
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not pause publishing.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def resume_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        bot_settings["publishing_paused"] = False
+        await save_bot_config()
+        await update.message.reply_text(
+            "▶️ INSTAGRAM PUBLISHING RESUMED\n\n"
+            "The next eligible Reel will be published automatically."
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not resume publishing.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def retry_command(update, context):
+    if not await command_is_admin(update):
+        return
+    if queue_publish_lock.locked():
+        await update.message.reply_text(
+            "⏳ A Reel is currently being published. Please wait."
+        )
+        return
+
+    try:
+        manifests = await find_queue_manifests()
+        target = None
+        for item in manifests:
+            q = item["queue"]
+            if q.get("status") == "COMPLETED":
+                continue
+            if q.get("retry_after"):
+                target = item
+                break
+            if any(c.get("instagram_status") == "FAILED" for c in q.get("clips", [])):
+                target = item
+                break
+
+        if not target:
+            await update.message.reply_text("ℹ️ No failed Instagram queue found.")
+            return
+
+        q = target["queue"]
+        q["retry_after"] = None
+        if q.get("queue_version") != 2:
+            for clip in q.get("clips", []):
+                if clip.get("instagram_status") == "FAILED":
+                    clip["instagram_status"] = "NOT_POSTED"
+                    clip["status"] = "PENDING"
+                    break
+
+        await save_queue_manifest(target["message"], q)
+        await update.message.reply_text(
+            f"🔄 RETRYING\n\n🎬 {q.get('title', 'Untitled')}\n"
+            "Normal interval/window rules still apply."
+        )
+        await process_pending_queues()
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Retry failed.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def skip_command(update, context):
+    if not await command_is_admin(update):
+        return
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "⚠️ This permanently skips the next ready queued clip and "
+            "deletes that Telegram clip.\n\nUse /skip confirm to continue."
+        )
+        return
+    if queue_publish_lock.locked():
+        await update.message.reply_text(
+            "⏳ A Reel is currently being published. Please wait."
+        )
+        return
+
+    try:
+        manifests = await find_queue_manifests()
+        storage_channel = await find_storage_channel()
+
+        for item in manifests:
+            q = item["queue"]
+            if q.get("status") == "COMPLETED" or not q.get("processing_complete"):
+                continue
+
+            if q.get("queue_version") == 2 and "clip_message_ids" in q:
+                total = int(q.get("total_clips", 0))
+                next_index = int(q.get("next_clip_index", 1))
+                ids = q.get("clip_message_ids", [])
+                if next_index > total or next_index > len(ids):
+                    continue
+
+                # Persist the skip decision before deleting the clip.
+                q.setdefault("skipped_parts", []).append(next_index)
+                q["next_clip_index"] = next_index + 1
+                if q["next_clip_index"] > total:
+                    q["status"] = "COMPLETED"
+                await save_queue_manifest(item["message"], q)
+
+                try:
+                    await telethon_client.delete_messages(
+                        storage_channel, ids[next_index - 1]
+                    )
+                except Exception as delete_error:
+                    await update.message.reply_text(
+                        "⚠️ Queue advanced safely, but Telegram clip deletion failed.\n\n"
+                        f"Part: {next_index}/{total}\n"
+                        f"Error: {type(delete_error).__name__}: {delete_error}"
+                    )
+                    return
+
+                await update.message.reply_text(
+                    "⏭️ CLIP SKIPPED\n\n"
+                    f"🎬 {q.get('title', 'Untitled')}\n"
+                    f"Part: {next_index}/{total}\n"
+                    "🗑️ Telegram clip deleted."
+                )
+                return
+
+            for clip in q.get("clips", []):
+                if clip.get("instagram_status") in {"PUBLISHED", "SKIPPED"}:
+                    continue
+                clip_index = clip.get("index")
+                clip["instagram_status"] = "SKIPPED"
+                clip["status"] = "SKIPPED"
+                q.setdefault("skipped_parts", []).append(clip_index)
+                q["next_clip_index"] = int(clip_index) + 1
+                await save_queue_manifest(item["message"], q)
+                try:
+                    await telethon_client.delete_messages(
+                        storage_channel, clip.get("telegram_message_id")
+                    )
+                except Exception as delete_error:
+                    await update.message.reply_text(
+                        f"⚠️ Queue advanced, but Telegram deletion failed: {delete_error}"
+                    )
+                    return
+                await update.message.reply_text(
+                    f"⏭️ Skipped Part {clip_index} of {q.get('title', 'Untitled')}."
+                )
+                return
+
+        await update.message.reply_text("ℹ️ No ready queued clip is available to skip.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not skip the queued clip.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def reminder_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        if not context.args:
+            await update.message.reply_text(
+                "🔔 UPLOAD REMINDER\n\n"
+                f"Interval: {format_duration_human(UPLOAD_REMINDER_INTERVAL_SECONDS)}\n"
+                f"Enabled: {'YES' if bot_settings['notifications'].get('upload_reminder', True) else 'NO'}\n"
+                "Minimum interval: 1 hour"
+            )
+            return
+
+        if len(context.args) == 1 and context.args[0].lower() == "off":
+            bot_settings["notifications"]["upload_reminder"] = False
+            await save_bot_config()
+            await update.message.reply_text(
+                "🔕 Upload reminder disabled."
+            )
+            return
+
+        seconds = parse_duration(context.args[0], 3600)
+        bot_settings["reminder_seconds"] = seconds
+        bot_settings["notifications"]["upload_reminder"] = True
+        _apply_bot_settings(bot_settings)
+        await save_bot_config()
+
+        await update.message.reply_text(
+            f"✅ Upload reminder set to every {format_duration_human(seconds)}."
+        )
+    except Exception as e:
+        await update.message.reply_text(f"❌ Reminder not changed.\n\n{str(e)}")
+
+
+async def settings_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        n = bot_settings.get("notifications", {})
+        await update.message.reply_text(
+            "⚙️ BOT SETTINGS\n\n"
+            "📤 INSTAGRAM\n"
+            f"Interval: {format_duration_human(INSTAGRAM_POST_INTERVAL_SECONDS)}\n"
+            f"Publishing: {'PAUSED' if bot_settings.get('publishing_paused') else 'ACTIVE'}\n"
+            "Window: " + (
+                f"{format_clock_minutes(bot_settings['window_start_minutes'])} – "
+                f"{format_clock_minutes(bot_settings['window_end_minutes'])} IST"
+                if bot_settings.get("window_enabled") else "24/7"
+            ) + "\n\n"
+            "🔔 REMINDER\n"
+            f"Interval: {format_duration_human(UPLOAD_REMINDER_INTERVAL_SECONDS)}\n"
+            f"Enabled: {'YES' if n.get('upload_reminder', True) else 'NO'}\n\n"
+            "🔔 NOTIFICATIONS\n"
+            f"Processing complete: {'ON' if n.get('processing_complete', True) else 'OFF'}\n"
+            f"Processing failed: {'ON' if n.get('processing_failed', True) else 'OFF'}\n"
+            f"Reel published: {'ON' if n.get('published', True) else 'OFF'}\n"
+            f"Publish failed: {'ON' if n.get('publish_failed', True) else 'OFF'}\n"
+            f"Queue complete: {'ON' if n.get('queue_complete', True) else 'OFF'}\n\n"
+            "🌏 Timezone: Asia/Kolkata (IST)\n"
+            "✂️ Splitter: 60-second keyframe-aware stream copy\n"
+            "📦 Telegram transfer: 512 KB chunks"
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not read settings.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def storage_command(update, context):
+    if not await command_is_admin(update):
+        return
+    try:
+        storage_channel = await find_storage_channel()
+        if storage_channel is None:
+            raise RuntimeError(f'Could not find "{STORAGE_CHANNEL_NAME}".')
+
+        messages = await telethon_client.get_messages(storage_channel, limit=200)
+        counts = {
+            "videos": 0, "clips": 0, "queues": 0, "processing": 0,
+            "titles": 0, "config": 0, "reminders": 0
+        }
+
+        for message in messages:
+            text = message.message or ""
+            if message.video:
+                counts["videos"] += 1
+                if text.startswith(CLIP_MARKER):
+                    counts["clips"] += 1
+            if text.startswith(QUEUE_MARKER):
+                counts["queues"] += 1
+            elif text.startswith(PROCESSING_MARKER):
+                counts["processing"] += 1
+            elif text.startswith(TITLE_REQUEST_MARKER):
+                counts["titles"] += 1
+            elif text.startswith(CONFIG_MARKER):
+                counts["config"] += 1
+            elif text.startswith(UPLOAD_REMINDER_MARKER):
+                counts["reminders"] += 1
+
+        await update.message.reply_text(
+            "📦 TELEGRAM STORAGE\n\n"
+            f"Channel: {STORAGE_CHANNEL_NAME}\n"
+            f"Video messages: {counts['videos']}\n"
+            f"Generated clips: {counts['clips']}\n"
+            f"Queue manifests: {counts['queues']}\n"
+            f"Processing state: {counts['processing']}\n"
+            f"Title requests: {counts['titles']}\n"
+            f"Reminder messages: {counts['reminders']}\n"
+            f"Config messages: {counts['config']}\n\n"
+            "ℹ️ Latest 200 channel messages are counted."
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not inspect storage.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def clear_completed_command(update, context):
+    if not await command_is_admin(update):
+        return
+
+    manifests = await find_queue_manifests()
+    completed = [
+        item for item in manifests
+        if item["queue"].get("status") == "COMPLETED"
+    ]
+
+    if not context.args or context.args[0].lower() != "confirm":
+        await update.message.reply_text(
+            "🧹 CLEAR COMPLETED QUEUES\n\n"
+            f"Completed manifests: {len(completed)}\n\n"
+            "Only completed queue-manifest messages will be deleted.\n"
+            "Use /clear_completed confirm to continue."
+        )
+        return
+
+    storage_channel = await find_storage_channel()
+    deleted = 0
+    for item in completed:
+        try:
+            await telethon_client.delete_messages(
+                storage_channel, item["message"].id
+            )
+            deleted += 1
+        except Exception as e:
+            print(
+                f"⚠️ Could not delete completed manifest "
+                f"{item['message'].id}: {type(e).__name__}: {str(e)}"
+            )
+
+    await update.message.reply_text(
+        "🧹 COMPLETED QUEUE CLEANUP FINISHED\n\n"
+        f"Deleted: {deleted}\n"
+        f"Failed: {len(completed) - deleted}"
+    )
+
+
+async def cancel_command(update, context):
+    global current_processing_task
+
+    if not await command_is_admin(update):
+        return
+
+    task = current_processing_task
+    if task is None or task.done():
+        await update.message.reply_text(
+            "ℹ️ No video is currently being processed."
+        )
+        return
+
+    task.cancel()
+    await update.message.reply_text(
+        "🛑 CANCELLATION REQUESTED\n\n"
+        "The current processing task is being stopped.\n"
+        "The original video will be kept in Telegram."
+    )
+
+
+async def jobs_command(update, context):
+    if not await command_is_admin(update):
+        return
+
+    try:
+        processing = await load_processing_state()
+        manifests = await find_queue_manifests()
+        lines = ["🧩 CURRENT JOBS", ""]
+
+        if processing:
+            lines += [
+                "🟢 ACTIVE PROCESSING",
+                f"🎬 {processing.get('title', 'Unknown')}",
+                f"Video ID: {processing.get('video_message_id', 'Unknown')}",
+                ""
+            ]
+        else:
+            lines += ["🟢 ACTIVE PROCESSING", "None", ""]
+
+        found = False
+        for item in manifests:
+            q = item["queue"]
+            if q.get("status") == "COMPLETED":
+                continue
+            found = True
+            pub, wait, total = queue_summary(q)
+            lines += [
+                "📋 INSTAGRAM QUEUE",
+                f"🎬 {q.get('title', 'Untitled')}",
+                f"Progress: {pub}/{total}",
+                f"Waiting: {wait}",
+                f"Processing complete: {'YES' if q.get('processing_complete') else 'NO'}",
+                ""
+            ]
+
+        if not found:
+            lines.append("📋 INSTAGRAM QUEUES\nNone")
+
+        reply_text = "\n".join(lines)
+        if len(reply_text) > 3500:
+            reply_text = reply_text[:3500] + "\n\n…output truncated…"
+        await update.message.reply_text(reply_text)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Could not read jobs.\n\n{type(e).__name__}: {str(e)}"
+        )
+
+
+async def notifications_command(update, context):
+    if not await command_is_admin(update):
+        return
+
+    aliases = {
+        "processing": "processing_complete",
+        "processing_complete": "processing_complete",
+        "processing_failed": "processing_failed",
+        "published": "published",
+        "publish": "published",
+        "failed": "publish_failed",
+        "publish_failed": "publish_failed",
+        "complete": "queue_complete",
+        "queue_complete": "queue_complete",
+        "reminder": "upload_reminder",
+        "upload_reminder": "upload_reminder",
+    }
+
+    try:
+        if not context.args:
+            n = bot_settings["notifications"]
+            await update.message.reply_text(
+                "🔔 NOTIFICATIONS\n\n"
+                f"Processing complete: {'ON' if n.get('processing_complete', True) else 'OFF'}\n"
+                f"Processing failed: {'ON' if n.get('processing_failed', True) else 'OFF'}\n"
+                f"Reel published: {'ON' if n.get('published', True) else 'OFF'}\n"
+                f"Publish failed: {'ON' if n.get('publish_failed', True) else 'OFF'}\n"
+                f"Queue complete: {'ON' if n.get('queue_complete', True) else 'OFF'}\n"
+                f"Upload reminder: {'ON' if n.get('upload_reminder', True) else 'OFF'}\n\n"
+                "Use /notifications NAME on|off or /notifications all on|off."
+            )
+            return
+
+        if len(context.args) == 2 and context.args[0].lower() == "all":
+            value = context.args[1].lower()
+            if value not in {"on", "off"}:
+                raise ValueError("Use on or off.")
+            for key in bot_settings["notifications"]:
+                bot_settings["notifications"][key] = value == "on"
+        elif len(context.args) == 2:
+            key = aliases.get(context.args[0].lower())
+            value = context.args[1].lower()
+            if key is None:
+                raise ValueError(
+                    "Use processing, processing_failed, published, failed, complete, or reminder."
+                )
+            if value not in {"on", "off"}:
+                raise ValueError("Use on or off.")
+            bot_settings["notifications"][key] = value == "on"
+        else:
+            raise ValueError("Use /notifications NAME on|off.")
+
+        await save_bot_config()
+        await update.message.reply_text("✅ Notification settings updated.")
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Notification setting not changed.\n\n{str(e)}"
+        )
+
 
 async def publish_queue_now(
     update: Update,
@@ -3105,72 +4205,6 @@ async def test_public_url(
 
 
 # ============================================================
-# SHOW QUEUE
-# ============================================================
-
-async def show_queue(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    try:
-
-        storage_channel = (
-            await find_storage_channel()
-        )
-
-        if storage_channel is None:
-
-            raise RuntimeError(
-                f'Could not find "{STORAGE_CHANNEL_NAME}".'
-            )
-
-        messages = await telethon_client.get_messages(
-            storage_channel,
-            limit=100
-        )
-
-        manifest = None
-
-        for message in messages:
-
-            text = message.message or ""
-
-            if text.startswith(
-                QUEUE_MARKER
-            ):
-
-                manifest = message
-                break
-
-        if manifest is None:
-
-            await update.message.reply_text(
-                "📋 No queue manifest exists yet."
-            )
-
-            return
-
-        text = manifest.message
-
-        if len(text) > 3500:
-            text = text[:3500]
-
-        await update.message.reply_text(
-            "📋 CURRENT QUEUE\n\n"
-            + text
-        )
-
-    except Exception as e:
-
-        await update.message.reply_text(
-            "❌ Could not read queue.\n\n"
-            f"Error: {type(e).__name__}\n"
-            f"Details: {str(e)}"
-        )
-
-
-# ============================================================
 # BOT VIDEO HANDLER
 # ============================================================
 
@@ -3198,9 +4232,51 @@ async def handle_video(
 
 async def application_post_init(application):
     """
-    Start the Instagram queue worker after python-telegram-bot
-    has initialized its asyncio event loop.
+    Load persistent settings, register the Telegram command menu,
+    then start the Instagram queue worker.
     """
+    try:
+        await load_bot_config()
+    except Exception as e:
+        print(
+            "⚠️ Could not load persistent bot settings at startup: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+        _apply_bot_settings(bot_settings)
+
+    try:
+        await application.bot.set_my_commands([
+            BotCommand("start", "Connect this Telegram account"),
+            BotCommand("help", "Show all commands"),
+            BotCommand("status", "Show complete bot status"),
+            BotCommand("queue", "Show all current queues"),
+            BotCommand("next", "Show the next Instagram Reel"),
+            BotCommand("history", "Show completed video history"),
+            BotCommand("jobs", "Show processing and queue jobs"),
+            BotCommand("storage", "Show Telegram storage summary"),
+            BotCommand("window", "View or set publishing window"),
+            BotCommand("interval", "View or set Reel interval"),
+            BotCommand("pause", "Pause Instagram publishing"),
+            BotCommand("resume", "Resume Instagram publishing"),
+            BotCommand("retry", "Retry a failed Reel"),
+            BotCommand("skip", "Skip the next queued Reel"),
+            BotCommand("quota", "Check Instagram publishing quota"),
+            BotCommand("publish_queue", "Run an Instagram queue check"),
+            BotCommand("reminder", "View or set upload reminders"),
+            BotCommand("notifications", "View or set notifications"),
+            BotCommand("settings", "Show bot settings"),
+            BotCommand("test_telegram", "Test Telegram connection"),
+            BotCommand("test_instagram", "Test Instagram API"),
+            BotCommand("test_public_url", "Test public media URL"),
+            BotCommand("cancel", "Cancel current video processing"),
+            BotCommand("clear_completed", "Remove completed queue manifests"),
+        ])
+    except Exception as e:
+        print(
+            "⚠️ Could not register Telegram command menu: "
+            f"{type(e).__name__}: {str(e)}"
+        )
+
     application.create_task(
         instagram_queue_loop(),
         update=None
@@ -3274,47 +4350,40 @@ def main():
         .build()
     )
 
-    bot_application.add_handler(
-        CommandHandler(
-            "start",
-            start
-        )
-    )
+    command_handlers = [
+        ("start", start),
+        ("help", help_command),
+        ("status", status_command),
+        ("queue", queue_command),
+        ("next", next_command),
+        ("history", history_command),
+        ("jobs", jobs_command),
+        ("storage", storage_command),
+        ("window", window_command),
+        ("interval", interval_command),
+        ("pause", pause_command),
+        ("resume", resume_command),
+        ("retry", retry_command),
+        ("skip", skip_command),
+        ("quota", quota_command),
+        ("publish_queue", publish_queue_now),
+        ("reminder", reminder_command),
+        ("notifications", notifications_command),
+        ("settings", settings_command),
+        ("test_telegram", test_telegram),
+        ("test_instagram", test_instagram),
+        ("test_public_url", test_public_url),
+        ("cancel", cancel_command),
+        ("clear_completed", clear_completed_command),
+    ]
 
-    bot_application.add_handler(
-        CommandHandler(
-            "test_telegram",
-            test_telegram
+    for command_name, callback in command_handlers:
+        bot_application.add_handler(
+            CommandHandler(
+                command_name,
+                callback
+            )
         )
-    )
-
-    bot_application.add_handler(
-        CommandHandler(
-            "test_instagram",
-            test_instagram
-        )
-    )
-
-    bot_application.add_handler(
-        CommandHandler(
-            "queue",
-            show_queue
-        )
-    )
-
-    bot_application.add_handler(
-        CommandHandler(
-            "publish_queue",
-            publish_queue_now
-        )
-    )
-
-    bot_application.add_handler(
-        CommandHandler(
-            "test_public_url",
-            test_public_url
-        )
-    )
 
     bot_application.add_handler(
         MessageHandler(
