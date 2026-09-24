@@ -676,24 +676,45 @@ def unregister_public_media(token):
     print(f"🗑️ Temporary public media URL removed: {token}")
 
 
-def publish_reel_from_file(file_path, title, part_index, total_parts):
-    """
-    Upload one local video to Instagram as a Reel using the
-    URL-based Instagram publishing flow.
-
-    Important:
-    Instagram fetches the video from the temporary public URL.
-    The Telegram clip is NOT deleted by this function.
-    """
+def publish_reel_from_file(
+    file_path,
+    title,
+    part_index,
+    total_parts,
+    progress_callback=None,
+):
+    """Publish one Reel while optionally reporting live Instagram progress."""
     token = None
 
+    def report(phase, phase_percent, overall_percent, details):
+        if progress_callback:
+            progress_callback(phase, phase_percent, overall_percent, details)
+
     try:
+        report(
+            "PREPARING INSTAGRAM REEL",
+            0.0,
+            20.0,
+            f"📦 Part {part_index}/{total_parts}\n"
+            "🌐 Registering temporary public media URL...",
+        )
+
         token, public_url = register_public_media(file_path)
 
         caption = build_instagram_caption(
             title,
             part_index,
             total_parts
+        )
+
+        report(
+            "CREATING INSTAGRAM CONTAINER",
+            50.0,
+            27.0,
+            f"📦 Part {part_index}/{total_parts}\n"
+            "📤 Sending Reel container request to Instagram...\n"
+            "📐 Type: REELS\n"
+            "📲 Share to feed: true",
         )
 
         print(
@@ -723,6 +744,15 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
             f"✅ Instagram container created: {creation_id}"
         )
 
+        report(
+            "INSTAGRAM VIDEO PROCESSING",
+            0.0,
+            30.0,
+            f"📦 Part {part_index}/{total_parts}\n"
+            f"🆔 Container: {creation_id}\n"
+            "📡 Instagram is downloading/transcoding the Reel...",
+        )
+
         # Instagram needs time to download/transcode the video.
         # Poll until the container is ready.
         max_attempts = 60
@@ -750,7 +780,28 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 f"{attempt}/{max_attempts}: {status_code}"
             )
 
+            poll_percent = (attempt / max_attempts) * 100.0
+            overall = 30.0 + (50.0 * poll_percent / 100.0)
+            report(
+                "INSTAGRAM VIDEO PROCESSING",
+                poll_percent,
+                overall,
+                f"📦 Part {part_index}/{total_parts}\n"
+                f"🆔 Container: {creation_id}\n"
+                f"📡 Status: {status_code or 'PROCESSING'}\n"
+                f"🔎 Check: {attempt}/{max_attempts}\n"
+                f"⏳ Poll interval: {poll_seconds}s",
+            )
+
             if status_code == "FINISHED":
+                report(
+                    "INSTAGRAM VIDEO READY",
+                    100.0,
+                    80.0,
+                    f"📦 Part {part_index}/{total_parts}\n"
+                    f"🆔 Container: {creation_id}\n"
+                    "✅ Instagram finished processing the video.",
+                )
                 break
 
             if status_code in {
@@ -768,6 +819,15 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
                 "Instagram video processing timed out after "
                 f"{max_attempts * poll_seconds} seconds."
             )
+
+        report(
+            "PUBLISHING TO INSTAGRAM",
+            50.0,
+            90.0,
+            f"📦 Part {part_index}/{total_parts}\n"
+            f"🆔 Container: {creation_id}\n"
+            "🚀 Sending media_publish request...",
+        )
 
         print(
             f"🚀 Publishing Instagram Reel: {creation_id}"
@@ -790,6 +850,15 @@ def publish_reel_from_file(file_path, title, part_index, total_parts):
 
         print(
             f"🎉 Instagram Reel published successfully: {media_id}"
+        )
+
+        report(
+            "INSTAGRAM PUBLISHED",
+            100.0,
+            100.0,
+            f"📦 Part {part_index}/{total_parts}\n"
+            f"🆔 Instagram Media ID: {media_id}\n"
+            "✅ Publication confirmed by Instagram.",
         )
 
         return media_id
@@ -1273,19 +1342,19 @@ def build_instagram_caption(title, part_index, total_parts):
 # INSTAGRAM REEL PORTRAIT FORMAT
 # ============================================================
 
-async def format_clip_for_reels(input_path, output_path):
-    """
-    Convert one already-split clip to a portrait 1080x1920 canvas.
-
-    The existing splitter remains completely unchanged and still uses
-    keyframe-aware stream copy. This step runs AFTER splitting and only
-    prepares each finished clip for Instagram:
-      - keeps the complete source video (no crop)
-      - scales it proportionally to fit inside 1080x1920
-      - centers it horizontally and vertically
-      - uses black padding for the unused portrait area
-      - preserves audio when present
-    """
+async def format_clip_for_reels(
+    input_path,
+    output_path,
+    progress_reporter=None,
+    title="Video",
+    part_index=1,
+    total_parts=1,
+    overall_start=25.0,
+    overall_span=0.0,
+    workflow_started=None,
+    completed=None,
+):
+    """Convert one split clip to 1080x1920 while reporting live FFmpeg progress."""
     if not os.path.isfile(input_path):
         raise RuntimeError(f"Clip does not exist: {input_path}")
 
@@ -1293,6 +1362,8 @@ async def format_clip_for_reels(input_path, output_path):
         raise RuntimeError("Portrait formatting requires a separate output file.")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    duration = await get_video_duration(input_path)
+    started = workflow_started or time.monotonic()
 
     command = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
@@ -1308,6 +1379,7 @@ async def format_clip_for_reels(input_path, output_path):
         "-c:a", "aac",
         "-b:a", "128k",
         "-movflags", "+faststart",
+        "-progress", "pipe:1",
         output_path,
     ]
 
@@ -1319,9 +1391,46 @@ async def format_clip_for_reels(input_path, output_path):
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
-    stdout, stderr = await process.communicate()
 
-    if process.returncode != 0:
+    def on_progress(percent, processed_seconds, ffmpeg_speed):
+        if not progress_reporter:
+            return
+
+        elapsed = max(0.01, time.monotonic() - started)
+        if processed_seconds > 0:
+            remaining = max(0.0, duration - processed_seconds)
+            eta = remaining * elapsed / processed_seconds
+        else:
+            eta = None
+
+        overall = overall_start + (overall_span * percent / 100.0)
+        details = (
+            f"🎞️ Part {part_index}/{total_parts}\n"
+            f"🎨 Portrait conversion: {percent:5.1f}%\n"
+            f"⏱️ Encoded: {format_duration(processed_seconds)} / {format_duration(duration)}\n"
+            f"⚡ FFmpeg speed: {ffmpeg_speed or 'working'}"
+        )
+        progress_reporter.schedule(
+            build_live_processing_report(
+                title,
+                f"PORTRAIT FORMAT — Part {part_index}/{total_parts}",
+                percent,
+                overall,
+                elapsed,
+                eta,
+                details,
+                completed,
+            )
+        )
+
+    progress_task = asyncio.create_task(
+        monitor_ffmpeg_progress(process.stdout, duration, on_progress)
+    )
+    stderr = await process.stderr.read()
+    return_code = await process.wait()
+    await progress_task
+
+    if return_code != 0:
         error_text = stderr.decode(errors="replace").strip()
         raise RuntimeError(
             "FFmpeg failed to format the clip for Instagram.\n"
@@ -1331,6 +1440,26 @@ async def format_clip_for_reels(input_path, output_path):
     if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
         raise RuntimeError(
             "FFmpeg completed but produced no usable portrait Reel clip."
+        )
+
+    if progress_reporter:
+        elapsed = max(0.01, time.monotonic() - started)
+        progress_reporter.schedule(
+            build_live_processing_report(
+                title,
+                f"PORTRAIT FORMAT — Part {part_index}/{total_parts}",
+                100.0,
+                overall_start + overall_span,
+                elapsed,
+                0,
+                (
+                    f"🎞️ Part {part_index}/{total_parts}\n"
+                    "🎨 Portrait conversion: 100.0%\n"
+                    "📐 Output: 1080×1920\n"
+                    f"💾 Output: {os.path.getsize(output_path) / 1024 / 1024:.1f} MB"
+                ),
+                completed,
+            )
         )
 
     return output_path
@@ -1390,6 +1519,88 @@ def progress_bar(percent, width=20):
     return "█" * filled + "░" * (width - filled)
 
 
+def format_rate(bytes_per_second):
+    if not bytes_per_second or bytes_per_second <= 0:
+        return "--"
+    if bytes_per_second >= 1024 * 1024:
+        return f"{bytes_per_second / 1024 / 1024:.2f} MB/s"
+    return f"{bytes_per_second / 1024:.0f} KB/s"
+
+
+def format_eta(seconds):
+    if seconds is None or seconds <= 0:
+        return "--"
+    return f"~{format_duration(seconds)}"
+
+
+def build_live_processing_report(
+    title,
+    phase,
+    phase_percent,
+    overall_percent,
+    elapsed,
+    eta=None,
+    details=None,
+    completed=None,
+):
+    """Build the live Telegram processing dashboard."""
+    lines = [
+        "🎬 LIVE PROCESSING",
+        "",
+        f"🎞️ {title}",
+        "",
+        f"📊 Overall: {overall_percent:5.1f}%",
+        progress_bar(overall_percent, 24),
+        "",
+        f"🔄 Current: {phase}",
+        f"{progress_bar(phase_percent, 20)} {phase_percent:5.1f}%",
+        "",
+        f"⏱️ Elapsed: {format_duration(elapsed)}",
+        f"⏳ ETA: {format_eta(eta)}",
+    ]
+
+    if completed:
+        lines.extend(["", "✅ Completed:", completed])
+
+    if details:
+        lines.extend(["", "📡 Live details:", details])
+
+    return "\n".join(lines)
+
+
+async def monitor_ffmpeg_progress(stream, duration, callback):
+    """Read FFmpeg -progress output without changing the encode operation."""
+    last_seconds = 0.0
+    last_speed = None
+
+    while True:
+        raw = await stream.readline()
+        if not raw:
+            break
+
+        line = raw.decode(errors="replace").strip()
+
+        if line.startswith("out_time_ms="):
+            try:
+                last_seconds = max(0.0, int(line.split("=", 1)[1]) / 1_000_000)
+            except (TypeError, ValueError):
+                continue
+
+            percent = (
+                min(100.0, (last_seconds / duration) * 100.0)
+                if duration and duration > 0
+                else 0.0
+            )
+            callback(percent, last_seconds, last_speed)
+
+        elif line.startswith("speed="):
+            value = line.split("=", 1)[1]
+            last_speed = value if value and value != "N/A" else None
+
+        elif line == "progress=end":
+            callback(100.0, duration, last_speed)
+
+
 class TelegramProgressReporter:
     """Rate-limit progress edits and never queue a backlog of Telegram edits."""
 
@@ -1410,6 +1621,9 @@ class TelegramProgressReporter:
             return False
 
         async with self.lock:
+            if force:
+                self.pending_text = None
+                self.pending_force = False
             now = time.monotonic()
             if not force and now - self.last_update < self.min_interval:
                 return False
@@ -1846,7 +2060,8 @@ async def save_queue_manifest(manifest_message, queue):
 async def publish_one_queue_clip(
     manifest_message,
     queue,
-    clip
+    clip,
+    progress_reporter=None,
 ):
     storage_channel = await find_storage_channel()
 
@@ -1904,6 +2119,42 @@ async def publish_one_queue_clip(
             safe_name
         )
 
+        workflow_started = time.monotonic()
+        loop = asyncio.get_running_loop()
+
+        def schedule_publish_report(phase, phase_percent, overall_percent, details):
+            if not progress_reporter:
+                return
+            text = build_live_processing_report(
+                title,
+                phase,
+                phase_percent,
+                overall_percent,
+                time.monotonic() - workflow_started,
+                None,
+                details,
+                "📋 Clip selected from the completed Telegram queue",
+            )
+            loop.call_soon_threadsafe(
+                progress_reporter.schedule,
+                text,
+            )
+
+        if progress_reporter:
+            await progress_reporter.edit(
+                build_live_processing_report(
+                    title,
+                    f"INSTAGRAM QUEUE — Part {clip_index}/{queue.get('total_clips', 1)}",
+                    0.0,
+                    0.0,
+                    0.0,
+                    None,
+                    "📦 Loading the next Telegram clip...",
+                    "📋 Clip selected from the completed Telegram queue",
+                ),
+                force=True,
+            )
+
         print(
             f"📥 Downloading Telegram clip "
             f"{clip_index}/{queue.get('total_clips')}..."
@@ -1918,9 +2169,31 @@ async def publish_one_queue_clip(
         # situation as a failed download when the local file is complete.
         for attempt in range(1, 4):
             try:
+                download_started = time.monotonic()
+
+                def publish_download_progress(current, total):
+                    if not progress_reporter or not total:
+                        return
+                    percent = (current / total) * 100.0
+                    elapsed = max(0.01, time.monotonic() - download_started)
+                    speed = current / elapsed
+                    remaining = max(0, total - current)
+                    eta = remaining / speed if speed > 0 else None
+                    schedule_publish_report(
+                        f"DOWNLOAD TELEGRAM CLIP — Part {clip_index}/{queue.get('total_clips', 1)}",
+                        percent,
+                        percent * 0.25,
+                        (
+                            f"📦 {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
+                            f"⚡ Speed: {format_rate(speed)}\n"
+                            f"⏳ Remaining: {format_duration(eta) if eta is not None else '--'}"
+                        ),
+                    )
+
                 downloaded = await fast_download_telegram_media(
                     message,
                     local_path,
+                    progress_callback=publish_download_progress,
                 )
 
                 if os.path.isfile(local_path):
@@ -1977,7 +2250,8 @@ async def publish_one_queue_clip(
             local_path,
             title,
             clip_index,
-            queue.get("total_clips", 1)
+            queue.get("total_clips", 1),
+            schedule_publish_report,
         )
 
         # Instagram has confirmed publication. Mark it as published
@@ -2179,12 +2453,58 @@ async def _process_pending_queues():
                 "deleted_from_telegram": False,
             }
 
+            publish_progress_message = None
+            if admin_chat_id:
+                try:
+                    publish_progress_message = await bot_application.bot.send_message(
+                        chat_id=admin_chat_id,
+                        text=(
+                            "🎬 LIVE INSTAGRAM PUBLISHING\n\n"
+                            f"🎞️ {title}\n"
+                            f"📦 Part {next_index}/{total}\n\n"
+                            "🔄 Starting..."
+                        ),
+                    )
+                except Exception as progress_message_error:
+                    print(
+                        "⚠️ Could not create live Instagram progress message: "
+                        f"{type(progress_message_error).__name__}: {str(progress_message_error)}"
+                    )
+
+            publish_progress_reporter = (
+                TelegramProgressReporter(
+                    bot_application.bot,
+                    admin_chat_id,
+                    publish_progress_message.message_id,
+                    min_interval=3.0,
+                )
+                if publish_progress_message and admin_chat_id
+                else None
+            )
+
             try:
                 media_id = await publish_one_queue_clip(
                     manifest_message,
                     queue,
-                    clip
+                    clip,
+                    progress_reporter=publish_progress_reporter,
                 )
+
+                if publish_progress_reporter:
+                    await publish_progress_reporter.edit(
+                        "✅ INSTAGRAM REEL PUBLISHED\n\n"
+                        f"🎬 {title}\n"
+                        f"📦 Part {next_index}/{total}\n\n"
+                        "📊 Overall: 100.0%\n"
+                        f"{progress_bar(100, 24)}\n\n"
+                        f"🆔 Instagram Media ID: {media_id}\n"
+                        + (
+                            "🗑️ Telegram clip deleted after successful publishing."
+                            if clip.get("deleted_from_telegram")
+                            else "⚠️ Instagram published, but Telegram cleanup failed."
+                        ),
+                        force=True,
+                    )
 
                 # Advance only after Instagram has confirmed publication.
                 queue["next_clip_index"] = next_index + 1
@@ -2214,6 +2534,20 @@ async def _process_pending_queues():
 
             except Exception as e:
                 error_text = str(e)
+
+                if publish_progress_reporter:
+                    try:
+                        await publish_progress_reporter.edit(
+                            "❌ INSTAGRAM PUBLISH FAILED\n\n"
+                            f"🎬 {title}\n"
+                            f"📦 Part {next_index}/{total}\n\n"
+                            "📊 Progress stopped.\n\n"
+                            f"❌ {type(e).__name__}: {error_text}\n\n"
+                            "⚠️ Telegram clip was kept for retry.",
+                            force=True,
+                        )
+                    except Exception:
+                        pass
 
                 # Meta's Media Publish Limit Exceeded should not be hammered
                 # every minute. It is a rolling publishing-quota condition.
@@ -2551,12 +2885,13 @@ async def process_original_video(
             bot_application.bot,
             admin_chat_id,
             progress_message.message_id,
-            min_interval=2.0,
+            min_interval=3.0,
         )
 
         print("Downloading original...")
 
-        download_started = time.monotonic()
+        workflow_started = time.monotonic()
+        download_started = workflow_started
 
         def download_progress(current, total):
             if not total:
@@ -2565,14 +2900,22 @@ async def process_original_video(
             elapsed = max(0.01, time.monotonic() - download_started)
             speed = current / elapsed
             remaining_bytes = max(0, total - current)
-            eta = remaining_bytes / speed if speed > 0 else 0
+            eta = remaining_bytes / speed if speed > 0 else None
             progress_reporter.schedule(
-                "📥 DOWNLOADING ORIGINAL\n\n"
-                f"🎬 {title}\n\n"
-                f"{progress_bar(percent)} {percent:5.1f}%\n\n"
-                f"📦 {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
-                f"⚡ {speed / 1024 / 1024:.2f} MB/s\n"
-                f"⏳ ETA: ~{format_duration(eta)}"
+                build_live_processing_report(
+                    title,
+                    "DOWNLOAD ORIGINAL",
+                    percent,
+                    percent * 0.15,
+                    time.monotonic() - workflow_started,
+                    eta,
+                    (
+                        f"📦 {current / 1024 / 1024:.1f} / {total / 1024 / 1024:.1f} MB\n"
+                        f"⚡ Speed: {format_rate(speed)}\n"
+                        f"⏳ Remaining: {format_duration(eta) if eta is not None else '--'}"
+                    ),
+                    "⏳ Downloading source video",
+                )
             )
 
         downloaded_path = await download_original_when_ready(
@@ -2593,12 +2936,21 @@ async def process_original_video(
         os.makedirs(clips_directory, exist_ok=True)
 
         await progress_reporter.edit(
-            "✂️ FAST SPLITTING + UPLOADING\n\n"
-            f"🎬 {title}\n\n"
-            "⚡ Split stage: stream copy (no re-encoding)\n"
-            "📱 Each finished clip is formatted to 1080×1920 and centered\n"
-            "📤 Then it is uploaded to Telegram immediately.\n"
-            "⏳ Instagram publishing starts after ALL clips are ready.",
+            build_live_processing_report(
+                title,
+                "PREPARING SPLITTER",
+                0.0,
+                15.0,
+                time.monotonic() - workflow_started,
+                None,
+                (
+                    "⚡ Split: keyframe-aware stream copy (-c copy)\n"
+                    "🎨 Format: 1080×1920 portrait with black padding\n"
+                    "📤 Upload: 512 KB Telegram chunks\n"
+                    "🚫 Instagram publishing: blocked until every clip is ready"
+                ),
+                "✅ Source download complete",
+            ),
             force=True,
         )
 
@@ -2620,6 +2972,8 @@ async def process_original_video(
         uploaded_count = 0
         splitter_done = False
         seen_files = set()
+        expected_parts = 0
+        split_duration = 0.0
 
         async def upload_ready_clip(clip_path):
             nonlocal uploaded_count
@@ -2635,7 +2989,28 @@ async def process_original_video(
                 clips_directory,
                 f".portrait_part_{index:03d}.mp4",
             )
-            await format_clip_for_reels(final_path, portrait_path)
+            total_parts = max(1, expected_parts)
+            per_clip_span = 70.0 / total_parts
+            clip_overall_start = 25.0 + (index - 1) * per_clip_span
+            format_span = per_clip_span * 0.50
+            upload_span = per_clip_span * 0.50
+
+            await format_clip_for_reels(
+                final_path,
+                portrait_path,
+                progress_reporter=progress_reporter,
+                title=title,
+                part_index=index,
+                total_parts=total_parts,
+                overall_start=clip_overall_start,
+                overall_span=format_span,
+                workflow_started=workflow_started,
+                completed=(
+                    "✅ Source download complete\n"
+                    f"{'🔄 Splitter running' if not splitter_done else '✅ Split completed'}\n"
+                    f"📦 Telegram clips uploaded: {uploaded_count}/{total_parts}"
+                ),
+            )
             os.replace(portrait_path, final_path)
 
             caption = (
@@ -2652,15 +3027,29 @@ async def process_original_video(
                 elapsed = max(0.01, time.monotonic() - upload_started)
                 speed = current / elapsed
                 remaining_bytes = max(0, total_bytes - current)
-                eta = remaining_bytes / speed if speed > 0 else 0
+                eta = remaining_bytes / speed if speed > 0 else None
+                overall = clip_overall_start + format_span + (upload_span * percent / 100.0)
                 progress_reporter.schedule(
-                    "📤 UPLOADING READY CLIP\n\n"
-                    f"🎬 {title}\n\n"
-                    f"📦 Part {index}\n"
-                    f"{progress_bar(percent, 16)} {percent:5.1f}%\n"
-                    f"💾 {current / 1024 / 1024:.1f} / {total_bytes / 1024 / 1024:.1f} MB\n"
-                    f"⚡ {speed / 1024 / 1024:.2f} MB/s\n"
-                    f"⏳ ETA: ~{format_duration(eta)}"
+                    build_live_processing_report(
+                        title,
+                        f"TELEGRAM UPLOAD — Part {index}/{total_parts}",
+                        percent,
+                        overall,
+                        time.monotonic() - workflow_started,
+                        eta,
+                        (
+                            f"📦 Part {index}/{total_parts}\n"
+                            f"💾 {current / 1024 / 1024:.1f} / {total_bytes / 1024 / 1024:.1f} MB\n"
+                            f"⚡ Speed: {format_rate(speed)}\n"
+                            f"⏳ Remaining: {format_duration(eta) if eta is not None else '--'}\n"
+                            f"📤 Uploaded clips: {uploaded_count}/{total_parts}"
+                        ),
+                        (
+                            "✅ Source download complete\n"
+                            f"{'🔄 Splitter running' if not splitter_done else '✅ Split completed'}\n"
+                            f"📦 Previous clips uploaded: {uploaded_count}/{total_parts}"
+                        ),
+                    )
                 )
 
             # Upload the bytes first using the maximum supported Telegram
@@ -2747,6 +3136,10 @@ async def process_original_video(
                 boundaries.append(boundary)
                 current = boundary
 
+            nonlocal expected_parts, split_duration
+            expected_parts = len(boundaries) + 1
+            split_duration = duration
+
             command = [
                 "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                 "-i", original_path,
@@ -2756,6 +3149,7 @@ async def process_original_video(
                 "-segment_times", ",".join(f"{x:.3f}" for x in boundaries),
                 "-reset_timestamps", "1",
                 "-segment_format", "mp4",
+                "-progress", "pipe:1",
                 os.path.join(clips_directory, "part_%03d.mp4"),
             ]
             print("Running FAST stream-copy FFmpeg:")
@@ -2765,9 +3159,40 @@ async def process_original_video(
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
-            return proc, asyncio.create_task(proc.stderr.read()), duration, boundaries
 
-        process, stderr_task, source_duration, boundaries = await run_stream_splitter()
+            def split_progress(percent, processed_seconds, ffmpeg_speed):
+                elapsed = max(0.01, time.monotonic() - workflow_started)
+                overall = 15.0 + (10.0 * percent / 100.0)
+                details = (
+                    f"🎞️ Source duration: {format_duration(duration)}\n"
+                    f"⏱️ Segmented: {format_duration(processed_seconds)} / {format_duration(duration)}\n"
+                    f"✂️ Expected parts: {expected_parts}\n"
+                    f"⚡ FFmpeg speed: {ffmpeg_speed or 'working'}\n"
+                    f"📤 Uploaded clips: {uploaded_count}/{expected_parts}"
+                )
+                progress_reporter.schedule(
+                    build_live_processing_report(
+                        title,
+                        "FAST SPLIT — STREAM COPY",
+                        percent,
+                        overall,
+                        elapsed,
+                        None,
+                        details,
+                        (
+                            "✅ Source download complete\n"
+                            "🔄 FFmpeg is splitting without re-encoding"
+                        ),
+                    )
+                )
+
+            split_progress_task = asyncio.create_task(
+                monitor_ffmpeg_progress(proc.stdout, duration, split_progress)
+            )
+            stderr_task = asyncio.create_task(proc.stderr.read())
+            return proc, stderr_task, split_progress_task, duration, boundaries
+
+        process, stderr_task, split_progress_task, source_duration, boundaries = await run_stream_splitter()
         wait_task = asyncio.create_task(process.wait())
         while not wait_task.done():
             current_files = sorted(
@@ -2794,6 +3219,8 @@ async def process_original_video(
 
         return_code = await wait_task
         stderr = await stderr_task
+        await split_progress_task
+        splitter_done = True
         if return_code != 0:
             raise RuntimeError(
                 "FFmpeg failed to split the video.\n"
@@ -2821,6 +3248,29 @@ async def process_original_video(
         await save_queue_manifest(manifest_message, queue)
         processing_complete = True
 
+        await progress_reporter.edit(
+            build_live_processing_report(
+                title,
+                "PROCESSING COMPLETE — FINALIZING",
+                100.0,
+                95.0,
+                time.monotonic() - workflow_started,
+                None,
+                (
+                    f"✂️ Parts created: {len(uploaded_messages)}\n"
+                    "📤 All parts uploaded to Telegram\n"
+                    "📋 Instagram publishing is still blocked until this workflow finishes finalization"
+                ),
+                (
+                    "✅ Source download complete\n"
+                    "✅ Stream-copy split complete\n"
+                    "✅ Portrait formatting complete\n"
+                    "✅ Telegram upload complete"
+                ),
+            ),
+            force=True,
+        )
+
         print(f"FAST split/upload complete: {len(uploaded_messages)} clips.")
 
         # ----------------------------------------------------
@@ -2838,6 +3288,29 @@ async def process_original_video(
 
         print(
             "All clips successfully uploaded."
+        )
+
+        await progress_reporter.edit(
+            build_live_processing_report(
+                title,
+                "DELETING ORIGINAL VIDEO",
+                100.0,
+                97.0,
+                time.monotonic() - workflow_started,
+                None,
+                (
+                    f"🗑️ Removing original Telegram message {video_message_id}...\n"
+                    "🔒 Generated clips and queue are already safe in Telegram."
+                ),
+                (
+                    "✅ Source download complete\n"
+                    "✅ Stream-copy split complete\n"
+                    "✅ Portrait formatting complete\n"
+                    "✅ Telegram upload complete\n"
+                    "✅ Queue manifest saved"
+                ),
+            ),
+            force=True,
         )
 
         print(
@@ -2867,8 +3340,11 @@ async def process_original_video(
         await progress_reporter.edit(
             "✅ VIDEO PROCESSING COMPLETE!\n\n"
             f"🎬 {title}\n\n"
+            f"📊 Overall: 100.0%\n"
+            f"{progress_bar(100, 24)}\n\n"
             f"✂️ Parts created: {len(uploaded_messages)}\n"
             "📤 All parts uploaded to Telegram\n"
+            "🎨 All clips formatted to 1080×1920\n"
             "🗑️ Original video deleted\n\n"
             "📋 Instagram queue created.\n"
             "⏳ Waiting for automatic Instagram publishing.",
