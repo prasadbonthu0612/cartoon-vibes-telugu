@@ -1620,6 +1620,86 @@ async def append_clip_to_queue(
     )
 
 
+async def find_queue_manifests():
+    """Load all persistent queue manifests from Telegram, oldest first."""
+    storage_channel = await find_storage_channel()
+
+    if storage_channel is None:
+        return []
+
+    messages = await telethon_client.get_messages(
+        storage_channel,
+        limit=200
+    )
+
+    manifests = []
+
+    for message in messages:
+        text = message.message or ""
+
+        if not text.startswith(QUEUE_MARKER):
+            continue
+
+        try:
+            json_text = text.split("\n\n", 2)[-1]
+            queue = json.loads(json_text)
+
+            manifests.append({
+                "message": message,
+                "queue": queue,
+            })
+
+        except Exception as e:
+            print(
+                f"⚠️ Could not parse queue manifest "
+                f"{message.id}: {type(e).__name__}: {str(e)}"
+            )
+
+    # Oldest queue first so a newer upload cannot jump ahead of an older one.
+    manifests.sort(
+        key=lambda item: item["queue"].get("created_at", "")
+    )
+
+    return manifests
+
+
+async def save_queue_manifest(manifest_message, queue):
+    """Persist the compact queue state safely in its Telegram manifest message."""
+    manifest_json = json.dumps(
+        queue,
+        ensure_ascii=False,
+        separators=(",", ":")
+    )
+
+    manifest_text = (
+        f"{QUEUE_MARKER}\n\n"
+        f"Cartoon Instagram Bot Queue\n\n"
+        f"{manifest_json}"
+    )
+
+    # Stay safely below Telegram's 4096-character message limit.
+    if len(manifest_text) > 3500:
+        raise RuntimeError(
+            "Queue manifest is unexpectedly large. "
+            "The compact queue format was not preserved."
+        )
+
+    storage_channel = await find_storage_channel()
+
+    if storage_channel is None:
+        raise RuntimeError(
+            f'Could not find "{STORAGE_CHANNEL_NAME}".'
+        )
+
+    # safe_telethon_edit_message handles MessageNotModifiedError and
+    # Telegram FLOOD_WAIT responses without aborting video processing.
+    await safe_telethon_edit_message(
+        storage_channel,
+        manifest_message.id,
+        manifest_text
+    )
+
+
 # ============================================================
 # INSTAGRAM QUEUE PUBLISHER
 # ============================================================
