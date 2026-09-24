@@ -71,9 +71,6 @@ UPLOAD_REMINDER_INTERVAL_SECONDS = 3600
 # https://telegram-cartoon-bot-if57.onrender.com
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 
-# Portrait H.264 encoding is the most memory-intensive local operation.
-# Keep it bounded so a long source video cannot consume the whole Render instance.
-PORTRAIT_FFMPEG_THREADS = max(1, int(os.getenv("PORTRAIT_FFMPEG_THREADS", "2")))
 
 STORAGE_CHANNEL_NAME = "Cartoon Vibes Telugu Storage"
 
@@ -1340,134 +1337,6 @@ def build_instagram_caption(title, part_index, total_parts):
         f"{hashtags}"
     )
 
-
-
-# ============================================================
-# INSTAGRAM REEL PORTRAIT FORMAT
-# ============================================================
-
-async def format_clip_for_reels(
-    input_path,
-    output_path,
-    progress_reporter=None,
-    title="Video",
-    part_index=1,
-    total_parts=1,
-    overall_start=25.0,
-    overall_span=0.0,
-    workflow_started=None,
-    completed=None,
-):
-    """Convert one split clip to 1080x1920 while reporting live FFmpeg progress."""
-    if not os.path.isfile(input_path):
-        raise RuntimeError(f"Clip does not exist: {input_path}")
-
-    if os.path.abspath(input_path) == os.path.abspath(output_path):
-        raise RuntimeError("Portrait formatting requires a separate output file.")
-
-    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
-    duration = await get_video_duration(input_path)
-    started = workflow_started or time.monotonic()
-
-    command = [
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-i", input_path,
-        "-map", "0:v:0",
-        "-map", "0:a:0?",
-        "-vf",
-        "scale=1080:1920:force_original_aspect_ratio=decrease,"
-        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black",
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-crf", "23",
-        "-threads", str(PORTRAIT_FFMPEG_THREADS),
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-movflags", "+faststart",
-        "-progress", "pipe:1",
-        output_path,
-    ]
-
-    print("📱 Formatting clip for Instagram portrait Reel:")
-    print(" ".join(command))
-
-    process = await asyncio.create_subprocess_exec(
-        *command,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-
-    def on_progress(percent, processed_seconds, ffmpeg_speed):
-        if not progress_reporter:
-            return
-
-        elapsed = max(0.01, time.monotonic() - started)
-        if processed_seconds > 0:
-            remaining = max(0.0, duration - processed_seconds)
-            eta = remaining * elapsed / processed_seconds
-        else:
-            eta = None
-
-        overall = overall_start + (overall_span * percent / 100.0)
-        details = (
-            f"🎞️ Part {part_index}/{total_parts}\n"
-            f"🎨 Portrait conversion: {percent:5.1f}%\n"
-            f"⏱️ Encoded: {format_duration(processed_seconds)} / {format_duration(duration)}\n"
-            f"⚡ FFmpeg speed: {ffmpeg_speed or 'working'}"
-        )
-        progress_reporter.schedule(
-            build_live_processing_report(
-                title,
-                f"PORTRAIT FORMAT — Part {part_index}/{total_parts}",
-                percent,
-                overall,
-                elapsed,
-                eta,
-                details,
-                completed,
-            )
-        )
-
-    progress_task = asyncio.create_task(
-        monitor_ffmpeg_progress(process.stdout, duration, on_progress)
-    )
-    stderr = await process.stderr.read()
-    return_code = await process.wait()
-    await progress_task
-
-    if return_code != 0:
-        error_text = stderr.decode(errors="replace").strip()
-        raise RuntimeError(
-            "FFmpeg failed to format the clip for Instagram.\n"
-            f"{error_text[-2000:]}"
-        )
-
-    if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
-        raise RuntimeError(
-            "FFmpeg completed but produced no usable portrait Reel clip."
-        )
-
-    if progress_reporter:
-        elapsed = max(0.01, time.monotonic() - started)
-        progress_reporter.schedule(
-            build_live_processing_report(
-                title,
-                f"PORTRAIT FORMAT — Part {part_index}/{total_parts}",
-                100.0,
-                overall_start + overall_span,
-                elapsed,
-                0,
-                (
-                    f"🎞️ Part {part_index}/{total_parts}\n"
-                    "🎨 Portrait conversion: 100.0%\n"
-                    "📐 Output: 1080×1920\n"
-                    f"💾 Output: {os.path.getsize(output_path) / 1024 / 1024:.1f} MB"
-                ),
-                completed,
-            )
-        )
-
-    return output_path
 
 
 # ============================================================
@@ -3029,7 +2898,6 @@ async def process_original_video(
                 None,
                 (
                     "⚡ Split: keyframe-aware stream copy (-c copy)\n"
-                    "🎨 Format: 1080×1920 portrait with black padding\n"
                     "📤 Upload: 512 KB Telegram chunks\n"
                     "🚫 Instagram publishing: blocked until every clip is ready"
                 ),
@@ -3067,35 +2935,13 @@ async def process_original_video(
             if os.path.abspath(clip_path) != os.path.abspath(final_path):
                 os.replace(clip_path, final_path)
 
-            # The splitter above stays stream-copy/fast. Only after a complete
-            # split clip exists do we prepare it for the 9:16 Instagram canvas.
-            portrait_path = os.path.join(
-                clips_directory,
-                f".portrait_part_{index:03d}.mp4",
-            )
+            # The splitter output is already the final clip.
+            # No local re-encoding is performed; this keeps the fast
+            # stream-copy pipeline intact.
             total_parts = max(1, expected_parts)
             per_clip_span = 70.0 / total_parts
             clip_overall_start = 25.0 + (index - 1) * per_clip_span
-            format_span = per_clip_span * 0.50
-            upload_span = per_clip_span * 0.50
-
-            await format_clip_for_reels(
-                final_path,
-                portrait_path,
-                progress_reporter=progress_reporter,
-                title=title,
-                part_index=index,
-                total_parts=total_parts,
-                overall_start=clip_overall_start,
-                overall_span=format_span,
-                workflow_started=workflow_started,
-                completed=(
-                    "✅ Source download complete\n"
-                    f"{'🔄 Splitter running' if not splitter_done else '✅ Split completed'}\n"
-                    f"📦 Telegram clips uploaded: {uploaded_count}/{total_parts}"
-                ),
-            )
-            os.replace(portrait_path, final_path)
+            upload_span = per_clip_span
 
             caption = (
                 f"{CLIP_MARKER}\n"
@@ -3112,7 +2958,7 @@ async def process_original_video(
                 speed = current / elapsed
                 remaining_bytes = max(0, total_bytes - current)
                 eta = remaining_bytes / speed if speed > 0 else None
-                overall = clip_overall_start + format_span + (upload_span * percent / 100.0)
+                overall = clip_overall_start + (upload_span * percent / 100.0)
                 progress_reporter.schedule(
                     build_live_processing_report(
                         title,
@@ -3444,7 +3290,6 @@ async def process_original_video(
             f"{progress_bar(100, 24)}\n\n"
             f"✂️ Parts created: {len(uploaded_messages)}\n"
             "📤 All parts uploaded to Telegram\n"
-            "🎨 All clips formatted to 1080×1920\n"
             "🗑️ Original video deleted\n\n"
             "📋 Instagram queue created.\n"
             "⏳ Waiting for automatic Instagram publishing.",
