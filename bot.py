@@ -1310,7 +1310,18 @@ def build_instagram_hashtags(title):
         "episode", "ep", "part", "clip", "video", "season",
         "the", "and", "of", "a", "an"
     }
-    meaningful = [w.lower() for w in words if w.lower() not in ignored and not w.isdigit()]
+    # Ignore common season/episode/part markers such as S1, S01, E1, E01,
+    # P1, P01, as well as their word forms. This keeps a title like
+    # "Kick Buttowski S1 E1" as #kickbuttowski instead of #kickbuttowskis1e1.
+    meaningful = [
+        w.lower()
+        for w in words
+        if (
+            w.lower() not in ignored
+            and not w.isdigit()
+            and not re.fullmatch(r"[sep]\d+", w.lower())
+        )
+    ]
 
     if meaningful:
         title_tag = "#" + "".join(meaningful)
